@@ -11,7 +11,7 @@ Supported protocols:
   vmess://base64EncodedJSON
   hy2://password@host:port?sni=xxx&insecure=1
   hysteria2://password@host:port?sni=xxx
-  trojan://password@host:port?sni=xxx&type=ws&path=/api
+  anytls://password@host:port?sni=xxx&fp=chrome
   tuic://uuid:password@host:port?sni=xxx&alpn=h3&congestion_control=bbr
 
 Output: config.json with HTTP inbound on 127.0.0.1:8080
@@ -226,6 +226,29 @@ def parse_hysteria2(parsed, params):
     return outbound
 
 
+def parse_anytls(parsed, params):
+    """Translate anytls:// URI to a sing-box anytls outbound."""
+    outbound = {
+        "type": "anytls",
+        "tag": "proxy",
+        "server": parsed.hostname,
+        "server_port": parsed.port or 443,
+        "password": unquote(parsed.username or ""),
+    }
+    tls = {"enabled": True}
+    sni = params.get("sni", [""])[0]
+    if sni:
+        tls["server_name"] = sni
+    fp = params.get("fp", params.get("client-fingerprint", [""]))[0]
+    if fp:
+        tls["utls"] = {"enabled": True, "fingerprint": fp}
+    insecure = params.get("insecure", params.get("allowInsecure", ["0"]))[0]
+    if insecure == "1":
+        tls["insecure"] = True
+    outbound["tls"] = tls
+    return outbound
+
+
 def parse_trojan(parsed, params):
     """Translate trojan:// URI to a sing-box trojan outbound."""
     outbound = {
@@ -323,6 +346,8 @@ def main():
             outbound = parse_hysteria2(parsed, params)
         elif scheme == "trojan":
             outbound = parse_trojan(parsed, params)
+        elif scheme == "anytls":
+            outbound = parse_anytls(parsed, params)
         elif scheme == "tuic":
             outbound = parse_tuic(parsed, params)
         else:
