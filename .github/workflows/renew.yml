@@ -54,7 +54,17 @@ jobs:
         echo "✅ sing-box process alive"
         (command -v ss >/dev/null && ss -tlnp 2>/dev/null | grep 8080) || echo "(ss unavailable)"
         echo "--- proxy connectivity test ---"
-        curl -s -m 15 -x http://127.0.0.1:8080 https://api.ip.sb/ip && echo "  <- proxy OK" || echo "❌ proxy connect FAILED"
+        if ! curl -s -m 20 -x http://127.0.0.1:8080 https://api.ip.sb/ip; then
+          echo ""
+          echo "❌ proxy connect FAILED — outbound anytls node unreachable"
+          echo "   The sing-box process is alive but the proxy exit node cannot be reached."
+          echo "   This usually means the PROXY_URL node is down, blocked (cf shield), or low quality."
+          echo "   Update the PROXY_URL secret to a clean/working node and re-run."
+          exit 1
+        else
+          echo ""
+          echo "  <- proxy OK"
+        fi
 
     - name: Run Renew Script
       env:
