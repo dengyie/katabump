@@ -762,6 +762,7 @@ async function solveAltchaIfPresent(page, stageName = "Renew阶段", maxAttempts
             // 2. 一个扁平化的主循环：尝试 Renew 整个流程 (最多 20 次)
             for (let attempt = 1; attempt <= 20; attempt++) {
                 let hasCaptchaError = false;
+                let notDue = false;
 
                 // 1. 如果是重试 (attempt > 1)，说明之前失败了或者刚刷新完页面
                 // 我们直接开始寻找 Renew 按钮
@@ -886,6 +887,7 @@ async function solveAltchaIfPresent(page, stageName = "Renew阶段", maxAttempts
                                     await sendTelegramMessage(`⏳ *暂无法续期 (跳过)*\n用户: ${user.username}\n原因: 还没到时间\n下次可用: ${dateStr}`, skipShotPath);
 
                                     renewSuccess = false;
+                                    notDue = true;
                                     console.log(`   >> Not due; skipping user without treating renewal as successful.`);
                                     try {
                                         const closeBtn = modal.getByLabel('Close');
@@ -898,6 +900,8 @@ async function solveAltchaIfPresent(page, stageName = "Renew阶段", maxAttempts
                         } catch (e) { }
 
                         if (renewSuccess) break; // Break loop if not time yet
+
+                        if (notDue) break;
 
                         if (hasCaptchaError) {
                             console.log('   >> Error found. Refreshing page to reset Turnstile...');
