@@ -43,8 +43,18 @@ jobs:
         python proxy_handler.py
         echo "Starting sing-box..."
         nohup ./sing-box run -c config.json > singbox.log 2>&1 &
-        sleep 3
-        echo "sing-box started, HTTP inbound on 127.0.0.1:8080"
+        sleep 4
+        echo "--- singbox.log ---"
+        cat singbox.log || true
+        echo "--- health check ---"
+        if ! pgrep -f "./sing-box" > /dev/null; then
+          echo "❌ sing-box process not running"
+          exit 1
+        fi
+        echo "✅ sing-box process alive"
+        (command -v ss >/dev/null && ss -tlnp 2>/dev/null | grep 8080) || echo "(ss unavailable)"
+        echo "--- proxy connectivity test ---"
+        curl -s -m 15 -x http://127.0.0.1:8080 https://api.ip.sb/ip && echo "  <- proxy OK" || echo "❌ proxy connect FAILED"
 
     - name: Run Renew Script
       env:
@@ -64,4 +74,6 @@ jobs:
         path: |
           *.png
           screenshots/
+          singbox.log
+          config.json
         if-no-files-found: ignore
