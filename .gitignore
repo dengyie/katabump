@@ -1,0 +1,6 @@
+# generated at runtime by proxy_handler.py from PROXY_URL secret
+config.json
+
+# python
+__pycache__/
+*.pyc

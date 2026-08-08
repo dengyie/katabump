@@ -321,6 +321,45 @@ def parse_tuic(parsed, params):
 # Main
 # ============================================================
 
+def _load_pool():
+    """Read pool.json (node topology, no passwords) if present."""
+    pool_file = os.environ.get("POOL_FILE", "pool.json")
+    if not os.path.exists(pool_file):
+        return []
+    with open(pool_file) as f:
+        data = json.load(f)
+    return [n for n in data if n.get("server") and n.get("port")]
+
+
+def _build_pool_outbounds(base_out, pool_nodes):
+    """Expand an anytls base outbound into one outbound per pool node.
+
+    All pool nodes share the same server domain + password; only port/SNI
+    differ. Password/fingerprint comes from the PROXY_URL credentials.
+    """
+    outbounds = []
+    for i, node in enumerate(pool_nodes, 1):
+        ob = json.loads(json.dumps(base_out))  # deep copy
+        ob["tag"] = f"node-{i}"
+        ob["server_port"] = int(node["port"])
+        if node.get("sni"):
+            ob.setdefault("tls", {}).setdefault("enabled", True)
+            ob["tls"]["server_name"] = node["sni"]
+        outbounds.append(ob)
+
+    outbounds.append(
+        {
+            "type": "urltest",
+            "tag": "proxy",
+            "outbounds": [f"node-{i}" for i in range(1, len(pool_nodes) + 1)],
+            "url": "https://www.gstatic.com/generate_204",
+            "interval": "30s",
+        }
+    )
+    outbounds.append({"type": "direct", "tag": "direct"})
+    return outbounds
+
+
 def main():
     proxy_url = os.environ.get("PROXY_URL", "").strip()
     if not proxy_url:
@@ -354,6 +393,17 @@ def main():
             print(f"Unsupported protocol: {scheme}")
             sys.exit(1)
 
+    # If the base proxy is anytls and a pool.json exists, expand into
+    # multiple node outbounds + a urltest group (auto-pick a reachable node).
+    outbounds = [outbound, {"type": "direct", "tag": "direct"}]
+    if scheme == "anytls":
+        pool = _load_pool()
+        if pool:
+            node_obs = _build_pool_outbounds(outbound, pool)
+            if node_obs:
+                outbounds = node_obs
+                print(f"  Pool mode: {len(pool)} nodes + urltest")
+
     config = {
         "log": {"level": "info", "timestamp": True},
         "inbounds": [
@@ -364,10 +414,9 @@ def main():
                 "listen_port": LISTEN_PORT,
             }
         ],
-        "outbounds": [
-            outbound,
-            {"type": "direct", "tag": "direct"},
-        ],
+        "outbounds": outbounds,
+        # Without this, curl through the HTTP inbound has no outbound to use.
+        "route": {"final": "proxy"},
     }
 
     with open("config.json", "w") as f:
