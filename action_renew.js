@@ -587,6 +587,69 @@ async function solveAltchaIfPresent(page, stageName = "Renew阶段", maxAttempts
     return false;
 }
 
+async function openServerDetails(page) {
+    const selectors = [
+        'a:has-text("See")',
+        'button:has-text("See")',
+        'a:has-text("View")',
+        'button:has-text("View")',
+        'a:has-text("Details")',
+        'button:has-text("Details")',
+        'a:has-text("Manage")',
+        'button:has-text("Manage")',
+        '[role="link"]:has-text("See")',
+        '[role="button"]:has-text("See")',
+    ];
+    for (const selector of selectors) {
+        try {
+            const loc = page.locator(selector).first();
+            if (await loc.isVisible({ timeout: 900 })) {
+                const label = (await loc.innerText().catch(() => '')).trim();
+                console.log(`   >> 服务器入口: ${selector} ${label ? `(${label})` : ''}`);
+                await loc.click({ timeout: 5000, force: true });
+                return selector;
+            }
+        } catch (e) { }
+    }
+    // Some dashboard versions render a card action with an aria-label/title only.
+    try {
+        const candidates = page.locator('a,button,[role="link"],[role="button"]');
+        const count = Math.min(await candidates.count(), 120);
+        for (let i = 0; i < count; i++) {
+            const loc = candidates.nth(i);
+            if (!(await loc.isVisible({ timeout: 250 }).catch(() => false))) continue;
+            const meta = await loc.evaluate(el => ({
+                text: (el.innerText || '').trim(),
+                aria: el.getAttribute('aria-label') || '',
+                title: el.getAttribute('title') || '',
+            })).catch(() => null);
+            if (!meta) continue;
+            const blob = `${meta.text} ${meta.aria} ${meta.title}`;
+            if (/see|view|detail|manage|服务器|server/i.test(blob)
+                && !/history|记录|help|帮助|logout|退出/i.test(blob)) {
+                console.log(`   >> 服务器入口候选: ${blob.slice(0, 100)}`);
+                await loc.click({ timeout: 5000, force: true });
+                return 'generic-server-entry';
+            }
+        }
+    } catch (e) { }
+    return null;
+}
+
+async function saveDashboardDiagnostic(page, reason) {
+    try {
+        const dir = path.join(process.cwd(), 'screenshots');
+        if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+        const safe = String(reason).replace(/[^a-z0-9_-]/gi, '_').slice(0, 60);
+        await page.screenshot({ path: path.join(dir, `dashboard_${safe}.png`), fullPage: true });
+        const text = await page.locator('body').innerText({ timeout: 3000 }).catch(() => '');
+        fs.writeFileSync(path.join(dir, `dashboard_${safe}.txt`), text.slice(0, 12000), 'utf8');
+        console.log(`   >> Dashboard diagnostic saved: ${safe}`);
+    } catch (e) {
+        console.log(`   >> Dashboard diagnostic failed: ${e.message}`);
+    }
+}
+
 (async () => {
   // Scheduled runs use a bounded delay; do not defer renewal by up to 3 hours.
   if (GITHUB_EVENT_NAME === 'schedule') {
@@ -747,13 +810,19 @@ async function solveAltchaIfPresent(page, stageName = "Renew阶段", maxAttempts
                 console.log('登录错误:', e.message);
             }
 
-            console.log('正在寻找 "See" 链接...');
+            console.log('正在寻找服务器详情入口...');
             try {
-                await page.getByRole('link', { name: 'See' }).first().waitFor({ timeout: 15000 });
+                const opened = await openServerDetails(page);
+                if (!opened) {
+                    const url = page.url();
+                    console.log(`未找到服务器详情入口。url=${url}`);
+                    await saveDashboardDiagnostic(page, 'server_entry_missing');
+                    continue;
+                }
                 await page.waitForTimeout(1000);
-                await page.getByRole('link', { name: 'See' }).first().click();
             } catch (e) {
-                console.log('未找到 "See" 按钮。');
+                console.log(`服务器详情入口失败: ${e.message}`);
+                await saveDashboardDiagnostic(page, 'server_entry_error');
                 continue;
             }
 
