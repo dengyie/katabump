@@ -43,7 +43,13 @@ jobs:
         python proxy_handler.py
         echo "Starting sing-box..."
         nohup ./sing-box run -c config.json > singbox.log 2>&1 &
-        sleep 4
+        # urltest group needs time to probe all pool nodes before first use
+        for i in $(seq 1 12); do
+          sleep 2
+          if [ "$i" -eq 12 ]; then
+            echo "waited 24s for urltest to settle"
+          fi
+        done
         echo "--- singbox.log ---"
         cat singbox.log || true
         echo "--- health check ---"
@@ -54,16 +60,18 @@ jobs:
         echo "✅ sing-box process alive"
         (command -v ss >/dev/null && ss -tlnp 2>/dev/null | grep 8080) || echo "(ss unavailable)"
         echo "--- proxy connectivity test ---"
-        if ! curl -s -m 20 -x http://127.0.0.1:8080 https://api.ip.sb/ip; then
+        if ! curl -s -m 30 -x http://127.0.0.1:8080 https://api.ip.sb/ip; then
           echo ""
-          echo "❌ proxy connect FAILED — outbound anytls node unreachable"
-          echo "   The sing-box process is alive but the proxy exit node cannot be reached."
-          echo "   This usually means the PROXY_URL node is down, blocked (cf shield), or low quality."
-          echo "   Update the PROXY_URL secret to a clean/working node and re-run."
+          echo "❌ proxy connect FAILED — no reachable anytls node in pool"
+          echo "   The sing-box process is alive but every PROXY_URL/pool node timed out."
+          echo "   Could be cap on the airline nodes, the GH runner egress block, or a bad PROXY_URL."
+          echo "   Check the run's singbox.log artifact for which node the urltest picked."
           exit 1
         else
           echo ""
           echo "  <- proxy OK"
+          # show which node the urltest group selected (sing-box debug line)
+          grep -iE "urltest|selected|node-" singbox.log | tail -5 || true
         fi
 
     - name: Run Renew Script
