@@ -788,6 +788,36 @@ async function saveDashboardDiagnostic(page, reason) {
                 // --------------------------------------------
 
                 await page.getByRole('button', { name: 'Login', exact: true }).click();
+                await page.waitForTimeout(2500);
+
+                const loginUrlAfterSubmit = page.url();
+                if (/error=captcha/i.test(loginUrlAfterSubmit)) {
+                    console.log('   >> 登录提交后仍为 captcha error,重试 Turnstile/登录...');
+                    let cleared = false;
+                    for (let captchaRetry = 1; captchaRetry <= 3; captchaRetry++) {
+                        let retryClick = false;
+                        for (let findAttempt = 0; findAttempt < 12; findAttempt++) {
+                            retryClick = await attemptTurnstileCdp(page);
+                            if (retryClick) break;
+                            await page.waitForTimeout(700);
+                        }
+                        if (retryClick) await page.waitForTimeout(2500);
+                        const currentUrl = page.url();
+                        if (!/error=captcha/i.test(currentUrl)) {
+                            cleared = true;
+                            break;
+                        }
+                        if (captchaRetry < 3) {
+                            await page.getByRole('button', { name: 'Login', exact: true }).click().catch(() => {});
+                            await page.waitForTimeout(2500);
+                        }
+                    }
+                    if (!cleared) {
+                        console.log(`   >> 登录验证码仍未通过: ${page.url()}`);
+                        await saveDashboardDiagnostic(page, 'login_captcha_failed');
+                        continue;
+                    }
+                }
 
                 // User Request: Check for incorrect password
                 try {
