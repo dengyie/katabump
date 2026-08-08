@@ -588,9 +588,9 @@ async function solveAltchaIfPresent(page, stageName = "Renew阶段", maxAttempts
 }
 
 (async () => {
-  // Random delay for scheduled runs (anti-detection)
+  // Scheduled runs use a bounded delay; do not defer renewal by up to 3 hours.
   if (GITHUB_EVENT_NAME === 'schedule') {
-    const maxDelaySec = 3 * 60 * 60;
+    const maxDelaySec = 15 * 60;
     const delaySec = Math.floor(Math.random() * maxDelaySec);
     const hours = Math.floor(delaySec / 3600);
     const minutes = Math.floor((delaySec % 3600) / 60);
@@ -885,7 +885,8 @@ async function solveAltchaIfPresent(page, stageName = "Renew阶段", maxAttempts
 
                                     await sendTelegramMessage(`⏳ *暂无法续期 (跳过)*\n用户: ${user.username}\n原因: 还没到时间\n下次可用: ${dateStr}`, skipShotPath);
 
-                                    renewSuccess = true; // Mark as done to stop retries
+                                    renewSuccess = false;
+                                    console.log(`   >> Not due; skipping user without treating renewal as successful.`);
                                     try {
                                         const closeBtn = modal.getByLabel('Close');
                                         if (await closeBtn.isVisible()) await closeBtn.click();

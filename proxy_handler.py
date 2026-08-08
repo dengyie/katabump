@@ -11,6 +11,7 @@ Supported protocols:
   vmess://base64EncodedJSON
   hy2://password@host:port?sni=xxx&insecure=1
   hysteria2://password@host:port?sni=xxx
+  trojan://password@host:port?sni=xxx&type=ws&path=/api
   tuic://uuid:password@host:port?sni=xxx&alpn=h3&congestion_control=bbr
 
 Output: config.json with HTTP inbound on 127.0.0.1:8080
@@ -225,6 +226,39 @@ def parse_hysteria2(parsed, params):
     return outbound
 
 
+def parse_trojan(parsed, params):
+    """Translate trojan:// URI to a sing-box trojan outbound."""
+    outbound = {
+        "type": "trojan",
+        "tag": "proxy",
+        "server": parsed.hostname,
+        "server_port": parsed.port or 443,
+        "password": unquote(parsed.username or ""),
+    }
+    tls = {"enabled": True}
+    sni = params.get("sni", [""])[0]
+    if sni:
+        tls["server_name"] = sni
+    insecure = params.get("insecure", params.get("allowInsecure", ["0"]))[0]
+    if insecure == "1":
+        tls["insecure"] = True
+    alpn = params.get("alpn", [""])[0]
+    if alpn:
+        tls["alpn"] = alpn.split(",")
+    outbound["tls"] = tls
+    transport = params.get("type", [""])[0]
+    if transport == "ws":
+        ws = {"type": "ws"}
+        path = params.get("path", [""])[0]
+        if path:
+            ws["path"] = unquote(path)
+        host = params.get("host", [""])[0]
+        if host:
+            ws["headers"] = {"Host": host}
+        outbound["transport"] = ws
+    return outbound
+
+
 def parse_tuic(parsed, params):
     outbound = {
         "type": "tuic",
@@ -287,6 +321,8 @@ def main():
             outbound = parse_vless(parsed, params)
         elif scheme in ("hy2", "hysteria2"):
             outbound = parse_hysteria2(parsed, params)
+        elif scheme == "trojan":
+            outbound = parse_trojan(parsed, params)
         elif scheme == "tuic":
             outbound = parse_tuic(parsed, params)
         else:
