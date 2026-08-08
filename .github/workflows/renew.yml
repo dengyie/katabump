@@ -33,7 +33,7 @@ jobs:
           echo "PROXY_URL not set, skipping sing-box setup."
           exit 0
         fi
-        SINGBOX_VER="1.11.0"
+        SINGBOX_VER="1.13.16"
         echo "Downloading sing-box v${SINGBOX_VER}..."
         wget -q "https://github.com/SagerNet/sing-box/releases/download/v${SINGBOX_VER}/sing-box-${SINGBOX_VER}-linux-amd64.tar.gz"
         tar -xzf "sing-box-${SINGBOX_VER}-linux-amd64.tar.gz"
