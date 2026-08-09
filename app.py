@@ -133,6 +133,54 @@ _WININFO_JS = """
 })()
 """
 
+# Turnstile 复选框 iframe 的可见包围盒（用于 xdotool 物理点击）
+_TURNSTILE_BBOX_JS = """
+(function(){
+    function expand(f){
+        f.style.width='300px'; f.style.height='80px';
+        f.style.minWidth='300px'; f.style.minHeight='80px';
+        f.style.visibility='visible'; f.style.opacity='1';
+        f.style.zIndex='9999';
+        var p=f.parentElement, guard=0;
+        while(p && guard<14){ p.style.overflow='visible'; p=p.parentElement; guard++; }
+        var r=f.getBoundingClientRect();
+        return { x: Math.round(r.left), y: Math.round(r.top),
+                 w: Math.round(r.width), h: Math.round(r.height) };
+    }
+    if (!window.frames) return null;
+    var frames = document.querySelectorAll('iframe');
+    for (var i=0;i<frames.length;i++){
+        var f=frames[i]; var src=f.src||'';
+        if (src.indexOf('challenges.cloudflare.com')>-1 || src.indexOf('/turnstile/')>-1){
+            var r=f.getBoundingClientRect();
+            if (r.width>0 && r.height>0) return expand(f);
+        }
+    }
+    // 兜底：Turnstile 组件容器内部的 iframe
+    var q = document.querySelector(
+        '[class*="cf-turnstile"] iframe, [id*="turnstile"] iframe, '+
+        '[class*="turnstile"] iframe, .cf-turnstile-wrapper iframe'
+    );
+    if (q) return expand(q);
+    return null;
+})()
+"""
+
+# 页面所有 iframe 的 src + 矩形（诊断用）
+_IFRAME_MAP_JS = """
+(function(){
+    var out=[];
+    var frames=document.querySelectorAll('iframe');
+    for (var i=0;i<frames.length;i++){
+        var f=frames[i], r=f.getBoundingClientRect();
+        out.push({ src:(f.src||'').slice(0,80),
+                   x:Math.round(r.left), y:Math.round(r.top),
+                   w:Math.round(r.width), h:Math.round(r.height) });
+    }
+    return JSON.stringify(out);
+})()
+"""
+
 # ===== 自动续期相关 =====
 
 # 在模态框内查找 iframe 并展开，返回点击坐标
@@ -229,7 +277,65 @@ def _xdotool_click(x: int, y: int):
     except Exception:
         os.system(f"xdotool mousemove {x} {y} click 1 2>/dev/null")
 
-#  人机验证处理（使用 SeleniumBase 内置 uc_gui_click_captcha）
+
+def _restart_proxy():
+    """重启 sing-box，让 urltest 重新探测，可能选中池子里另一个节点。
+
+    仅在 GitHub Actions 环境生效（本地无 sing-box 可执行文件则跳过）。
+    """
+    if not os.path.exists("sing-box"):
+        print("  （本环境无 sing-box 可执行文件，跳过代理节点切换）")
+        return
+    print("\n🔄 重启 sing-box 以切换代理节点...")
+    subprocess.run(["pkill", "-9", "-f", "sing-box"], capture_output=True)
+    time.sleep(2)
+    log = open("singbox.log", "ab")
+    try:
+        subprocess.Popen(
+            ["./sing-box", "run", "-c", "config.json"],
+            stdout=log, stderr=subprocess.STDOUT, start_new_session=True,
+        )
+    finally:
+        log.close()
+    # 等待 urltest 组完成第一轮探测
+    time.sleep(26)
+    try:
+        with open("singbox.log", "rb") as f:
+            lines = f.read().decode("utf-8", "ignore").splitlines()
+        shown = 0
+        for ln in lines[-40:]:
+            if ("urltest" in ln or "selected" in ln or "node-" in ln) and shown < 5:
+                print("   sing-box:", ln.strip())
+                shown += 1
+    except Exception:
+        pass
+
+def _switch_to_turnstile_frame(sb):
+    """切入页面上的 Turnstile iframe，返回是否成功。"""
+    try:
+        el = sb.driver.execute_script("""
+        (function(){
+            var frames = document.querySelectorAll('iframe');
+            for (var i = 0; i < frames.length; i++){
+                var f = frames[i], s = f.src || '';
+                if (s.indexOf('challenges.cloudflare.com') > -1 ||
+                    s.indexOf('turnstile') > -1) return f;
+            }
+            var q = document.querySelector(
+                '[class*="cf-turnstile"], [id*="turnstile"]');
+            if (q){ var qf = q.querySelector('iframe'); if (qf) return qf; }
+            return null;
+        })()
+        """)
+        if el is None:
+            return False
+        sb.driver.switch_to.frame(el)
+        return True
+    except Exception:
+        return False
+
+
+#  人机验证处理（多策略：SeleniumBase UC GUI 点击 + xdotool 物理点击 + iframe 内 JS 点击）
 def handle_turnstile(sb) -> bool:
     print("🔍 处理 Cloudflare Turnstile 验证...")
     time.sleep(2)
@@ -239,35 +345,124 @@ def handle_turnstile(sb) -> bool:
         print("✅ 已静默通过")
         return True
 
-    # 尝试展开 Turnstile（防止被父容器 overflow:hidden 裁剪）
+    # 记录页面 iframe 布局（诊断用）
+    try:
+        fm = sb.execute_script(_IFRAME_MAP_JS)
+        print(f"  📄 页面 iframe: {fm}")
+    except Exception:
+        pass
+
+    # 展开 Turnstile 验证框（防止被父容器 overflow:hidden 裁剪）
     for _ in range(3):
         try: sb.execute_script(_EXPAND_JS)
         except Exception: pass
         time.sleep(0.5)
 
-    # 使用 SeleniumBase 内置 uc_gui_click_captcha 处理 Turnstile
-    # 该方法自动完成：检测验证码类型 → 定位 iframe → 计算坐标 → PyAutoGUI 平滑点击
-    for attempt in range(6):
+    # ── 策略 A：SeleniumBase UC 内置 GUI 点击 ──
+    for attempt in range(4):
         if sb.execute_script(_SOLVED_JS):
-            print(f"✅ Turnstile 通过（第 {attempt} 次尝试）")
+            print(f"✅ Turnstile 通过（A 第 {attempt + 1} 次）")
             return True
-
-        print(f"🖱️ 第 {attempt + 1} 次调用 uc_gui_click_captcha...")
+        print(f"🖱️ [A] 第 {attempt + 1}/4 次调用 uc_gui_click_captcha...")
         try:
-            sb.uc_gui_click_captcha()
+            if attempt < 2:
+                sb.uc_gui_click_captcha()
+            else:
+                sb.uc_gui_click_cf(frame="iframe", retry=True, blind=True)
         except Exception as e:
-            print(f"⚠️ uc_gui_click_captcha 调用异常: {e}")
-
-        # 等待验证结果（最多 8 秒）
-        for _ in range(16):
+            print(f"⚠️ [A] 调用异常: {e}")
+        solved = False
+        for _ in range(8):
             time.sleep(0.5)
             if sb.execute_script(_SOLVED_JS):
-                print(f"✅ Turnstile 通过（第 {attempt + 1} 次尝试）")
-                return True
+                solved = True
+                break
+        if solved:
+            print(f"✅ Turnstile 通过（A 第 {attempt + 1} 次）")
+            return True
 
-        print(f"⚠️ 第 {attempt + 1} 次未通过，重试...")
+    # ── 策略 B：xdotool 物理点击复选框坐标（与 ALTCHA 同机制） ──
+    for attempt in range(4):
+        if sb.execute_script(_SOLVED_JS):
+            print("✅ Turnstile 通过（B 前缀检查）")
+            return True
+        bbox = None
+        try:
+            bbox = sb.execute_script(_TURNSTILE_BBOX_JS)
+        except Exception:
+            bbox = None
+        if not bbox:
+            print("⚠️ [B] 未定位到 Turnstile iframe，稍等重试...")
+            time.sleep(2)
+            continue
+        try:
+            wi = sb.execute_script(_WININFO_JS)
+        except Exception:
+            wi = {"sx": 0, "sy": 0, "oh": 800, "ih": 768}
+        bar = wi.get("oh", 800) - wi.get("ih", 768)
+        cx = bbox["x"] + wi.get("sx", 0) + 30          # 复选框在 iframe 左侧约 30px
+        cy = bbox["y"] + wi.get("sy", 0) + bar + max(28, int(bbox["h"]) // 2)
+        print(f"🖱️ [B] xdotool 点击复选框 ({cx}, {cy})  bbox={bbox}")
+        _xdotool_click(cx, cy)
+        solved = False
+        for _ in range(8):
+            time.sleep(0.5)
+            if sb.execute_script(_SOLVED_JS):
+                solved = True
+                break
+        if solved:
+            print(f"✅ Turnstile 通过（B 第 {attempt + 1} 次）")
+            return True
+        print(f"  ⚠️ [B] 第 {attempt + 1} 次未通过")
 
-    print("  ❌ Turnstile 6 次均失败")
+    # ── 策略 C：切入 iframe 直接点击复选框元素 ──
+    for attempt in range(3):
+        if sb.execute_script(_SOLVED_JS):
+            print("✅ Turnstile 通过（C 前缀检查）")
+            return True
+        print(f"🖱️ [C] 第 {attempt + 1}/3 切入 iframe 尝试...")
+        if not _switch_to_turnstile_frame(sb):
+            print("  ⚠️ [C] 未找到 Turnstile iframe")
+            sb.driver.switch_to.default_content()
+            time.sleep(2)
+            continue
+        try:
+            cb = sb.driver.execute_script("""
+            (function(){
+                var cands = document.querySelectorAll(
+                    '[role="checkbox"], input[type="checkbox"],'+
+                    '[class*="checkbox"], [class*="btn-check"]'
+                );
+                for (var i = 0; i < cands.length; i++){
+                    var e = cands[i]; var r = e.getBoundingClientRect();
+                    if (r.width > 0 && r.height > 0) return e;
+                }
+                return null;
+            })()
+            """)
+            if cb is not None:
+                sb.driver.execute_script(
+                    "arguments[0].focus(); arguments[0].click();", cb)
+                print("    [C] 已 click 复选框元素")
+            else:
+                # 没找到复选框：尝试空格键触发
+                sb.driver.switch_to.active_element.send_keys(" ")
+                print("    [C] 未找到复选框元素，发送空格键")
+        except Exception as e:
+            print(f"    ⚠️ [C] 异常: {e}")
+        finally:
+            sb.driver.switch_to.default_content()
+        solved = False
+        for _ in range(6):
+            time.sleep(1)
+            if sb.execute_script(_SOLVED_JS):
+                solved = True
+                break
+        if solved:
+            print(f"✅ Turnstile 通过（C 第 {attempt + 1} 次）")
+            return True
+
+    print("  ❌ Turnstile A/B/C 策略均失败")
     return False
 
 #  账户登录
@@ -633,6 +828,32 @@ def renew_server(sb):
     _check_renew_result(sb)
 
 
+def _run_account(sb_kwargs, email, pwd) -> bool:
+    """单个账号：启动浏览器 -> 登录 -> 自动续期。返回是否成功。"""
+    global CURRENT_EMAIL
+    CURRENT_EMAIL = email
+    print("🚀 启动浏览器...")
+    try:
+        with SB(**sb_kwargs) as sb:
+            try:
+                sb.open("https://api.ip.sb/ip")
+                print(f"📍  当前出口IP: {sb.get_text('body')}")
+            except Exception:
+                pass
+
+            if login(sb, email, pwd):
+                renew_server(sb)   # 登录成功后自动续期
+                return True
+            else:
+                print("\n❌ 登录失败，终止该账号续期操作。")
+                send_tg_message("❌", "登录失败", "未知")
+                return False
+    except Exception as e:
+        print(f"\n❌ 账号 {email} 处理异常: {e}")
+        send_tg_message("❌", f"处理异常: {e}", "未知")
+        return False
+
+
 #  脚本执行入口 (可选代理)
 def main():
     print("#" * 25)
@@ -656,33 +877,27 @@ def main():
     print(f"👥 共 {len(ACCOUNTS)} 个账号待处理")
 
     ok_count = 0
+    max_attempts = int(os.environ.get("NODE_ATTEMPTS", "3"))
     for idx, acc in enumerate(ACCOUNTS, 1):
         email = acc["email"]
         pwd   = acc["password"]
-        global CURRENT_EMAIL
-        CURRENT_EMAIL = email
         print("\n" + "=" * 25)
         print(f"  处理账号 {idx}/{len(ACCOUNTS)}: {email}")
         print("=" * 25)
 
-        print("🚀 启动浏览器...")
-        try:
-            with SB(**sb_kwargs) as sb:
-                try:
-                    sb.open("https://api.ip.sb/ip")
-                    print(f"📍  当前出口IP: {sb.get_text('body')}")
-                except Exception:
-                    pass
-
-                if login(sb, email, pwd):
-                    renew_server(sb)   # 登录成功后自动续期
-                    ok_count += 1
-                else:
-                    print("\n❌ 登录失败，终止该账号续期操作。")
-                    send_tg_message("❌", "登录失败", "未知")
-        except Exception as e:
-            print(f"\n❌ 账号 {email} 处理异常: {e}")
-            send_tg_message("❌", f"处理异常: {e}", "未知")
+        acc_ok = False
+        for attempt in range(1, max_attempts + 1):
+            print(f"  ── 节点尝试 {attempt}/{max_attempts} ──")
+            if attempt > 1:
+                _restart_proxy()   # 换池子里另一个节点再试
+            if _run_account(sb_kwargs, email, pwd):
+                acc_ok = True
+                break
+        if acc_ok:
+            ok_count += 1
+        else:
+            print(f"❌ 账号 {email} 所有节点尝试均失败")
+            send_tg_message("❌", "节点尝试均失败", f"{max_attempts} 次不同代理节点")
 
     print("\n" + "#" * 25)
     print(f"  全部账号处理完毕: {ok_count}/{len(ACCOUNTS)} 成功")
