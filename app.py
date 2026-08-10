@@ -62,12 +62,16 @@ def send_tg_message(status_icon, status_text, time_left=""):
     else:
         masked_email = (email[:2] + '****') if email else "未知"
 
+    # time_left 实际承载面板 alert / 失败详情（历史参数名保留）
+    detail = (time_left or "").strip()
     text = (
         f"🇫🇷 katabump 续期通知\n\n"
         f"{status_icon} {status_text}\n"
         f"👤 续期账户: {masked_email}\n"
         f"⏱️ 续期时间: {current_time_str}"
     )
+    if detail:
+        text += f"\n📋 详情: {detail}"
 
     url = f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendMessage"
     payload = {
