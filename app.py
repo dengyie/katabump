@@ -790,50 +790,109 @@ def _submit_renew(sb):
     time.sleep(3)
 
 
+
+RENEW_PASS = "ok"
+RENEW_COOLDOWN = "cooldown"
+RENEW_SUSPENDED = "suspended"
+RENEW_UNCONFIRMED = "unconfirmed"
+RENEW_UNKNOWN = "unknown"
+
+
+def _next_renewable(text):
+    """从文案提取『as of <date>(in N day(s))』或『in N day(s)』中的下次可续日期/天数。返回 (日期,天数)"""
+    import re as _re
+    low = (text or "").lower()
+    m = _re.search(r"as of\s+([^\n().]{2,40}?)(?:\s*\(in[\s]*(\d+)[^)]*days?\))?", low)
+    if m:
+        return m.group(1).strip(), (int(m.group(2)) if m.group(2) else None)
+    m2 = _re.search(r"in\s*(\d+)\s*day", low)
+    if m2:
+        return None, int(m2.group(1))
+    return None, None
+
+
+def _read_page_text(sb, timeout=4):
+    """读整页正文，续期结果判定不只看单条 div.alert"""
+    try:
+        return sb.get_text("body", timeout=timeout)
+    except Exception:
+        try:
+            t = sb.execute_script("return document.body.innerText")
+            return t or ""
+        except Exception:
+            return ""
+
+
+def _classify_renew(alert_text, page_text):
+    """权威归类续期结果。返回 (status, detail)。"""
+    body = (page_text or "") + "\n" + (alert_text or "")
+    low = body.lower()
+    if any(k in low for k in ("renewed", "successfully", "success", "extended", "has been renewed")):
+        return RENEW_PASS, (alert_text or "续期成功（确认文案）")
+    if "suspended" in low:
+        return RENEW_SUSPENDED, (alert_text or "服务器仍为 suspended，续期未生效")
+    if "can't renew" in low or "cannot renew" in low or "unable" in low:
+        return RENEW_COOLDOWN, (alert_text or "未到续期时间/冷却中")
+    if "server type" in low and "startup command" in low and "reset" in low:
+        # 历史里这条反复出现而实际未续上→不能算成功
+        return RENEW_UNCONFIRMED, (alert_text or "仅 server type 警告，无续保成功确认")
+    if alert_text:
+        return RENEW_UNKNOWN, alert_text
+    return RENEW_UNKNOWN, "未检测到明确提示"
+
+
 def _check_renew_result(sb):
-    """读取页面 alert 提示，判断续期结果并推送 TG 通知"""
+    """读取提示，判定续期是否真生效并推送 TG。返回 (status, detail)。"""
     print("\n📋 检查续期结果...")
     alert_text = _read_alert(sb)
     if not alert_text:
         time.sleep(3)
         alert_text = _read_alert(sb)
-
-    if alert_text:
-        print(f"📩 页面提示: {alert_text}")
-        low = alert_text.lower()
-        if "can't renew" in low or "unable" in low:
-            send_tg_message("⏳", "未到续期时间", alert_text)
-        elif any(kw in low for kw in ( "renewed", "success", "extended")):
-            send_tg_message("✅", "续期成功", alert_text)
-        else:
-            send_tg_message("ℹ️", "续期操作已执行", alert_text)
+    page_text = _read_page_text(sb)
+    status, detail = _classify_renew(alert_text, page_text)
+    print(f"📩 页面提示: {detail}")
+    if status == RENEW_PASS:
+        send_tg_message("✅", "续期成功", detail)
+    elif status == RENEW_COOLDOWN:
+        nd, ndays = _next_renewable((alert_text or "") + " " + page_text)
+        extra = f" | 下次可续: {nd} ({ndays}天后)" if (nd or ndays) else ""
+        send_tg_message("⏳", "未到续期时间（冷却中）", (detail or "") + extra)
+    elif status == RENEW_SUSPENDED:
+        send_tg_message("❌", "服务器已 suspended", detail)
+    elif status == RENEW_UNCONFIRMED:
+        send_tg_message("⚠️", "续期未确认，需人工核对", detail)
     else:
-        print("ℹ️ 未检测到明确的提示框，可能续期操作未生效")
-        send_tg_message("ℹ️", "续期操作已执行", "未检测到明确提示")
+        send_tg_message("ℹ️", "续期结果：无法确认", detail)
+    return status, detail
 
 
 def renew_server(sb):
-    """登录成功后调用：自动进入详情页 -> Renew -> ALTCHA -> 提交"""
+    """登录成功后调用：自动进入详情页 -> Renew -> ALTCHA -> 提交。
+    返回 dict(status, detail, before)：只有 status==RENEW_PASS 才算真续上。"""
     print("\n" + "#" * 25)
     print("  开始自动续期流程")
     print("#" * 25)
 
     if not _goto_server_detail(sb):
-        return
+        return {"status": RENEW_UNKNOWN, "detail": "未能进入详情页"}
+
+    before = _read_page_text(sb)[:500]
 
     if not _open_renew_modal(sb):
-        return
+        return {"status": RENEW_UNKNOWN, "detail": "未弹 Renew 模态框"}
 
     altcha_ok = _solve_altcha(sb)
     if not altcha_ok:
         print("⚠️ ALTCHA 验证未通过，仍尝试提交 Renew...")
 
     _submit_renew(sb)
-    _check_renew_result(sb)
+    status, detail = _check_renew_result(sb)
+    return {"status": status, "detail": detail, "before": before}
 
 
-def _run_account(sb_kwargs, email, pwd) -> bool:
-    """单个账号：启动浏览器 -> 登录 -> 自动续期。返回是否成功。"""
+def _run_account(sb_kwargs, email, pwd):
+    """单个账号：启动浏览器 -> 登录 -> 自动续期。
+    返回 status ∈ RENEW_*。RENEW_PASS 才算真续上；RENEW_COOLDOWN 为合法冷却；其余未确认为失败。"""
     global CURRENT_EMAIL
     CURRENT_EMAIL = email
     print("🚀 启动浏览器...")
@@ -845,18 +904,19 @@ def _run_account(sb_kwargs, email, pwd) -> bool:
             except Exception:
                 pass
 
-            if login(sb, email, pwd):
-                renew_server(sb)   # 登录成功后自动续期
-                return True
-            else:
+            if not login(sb, email, pwd):
                 print("\n❌ 登录失败，终止该账号续期操作。")
                 send_tg_message("❌", "登录失败", "未知")
-                return False
+                return RENEW_UNKNOWN
+
+            res = renew_server(sb)
+            st = res.get("status", RENEW_UNKNOWN) if isinstance(res, dict) else RENEW_UNKNOWN
+            print(f"ℹ️  账号 {email} 续期状态: {st}")
+            return st
     except Exception as e:
         print(f"\n❌ 账号 {email} 处理异常: {e}")
         send_tg_message("❌", f"处理异常: {e}", "未知")
-        return False
-
+        return RENEW_UNKNOWN
 
 #  脚本执行入口 (可选代理)
 def main():
@@ -880,7 +940,9 @@ def main():
 
     print(f"👥 共 {len(ACCOUNTS)} 个账号待处理")
 
-    ok_count = 0
+    renewed = 0
+    cooldown = 0
+    failed = 0
     max_attempts = int(os.environ.get("NODE_ATTEMPTS", "3"))
     for idx, acc in enumerate(ACCOUNTS, 1):
         email = acc["email"]
@@ -889,24 +951,32 @@ def main():
         print(f"  处理账号 {idx}/{len(ACCOUNTS)}: {email}")
         print("=" * 25)
 
-        acc_ok = False
+        acc_res = RENEW_UNKNOWN
         for attempt in range(1, max_attempts + 1):
             print(f"  ── 节点尝试 {attempt}/{max_attempts} ──")
             if attempt > 1:
-                _restart_proxy()   # 换池子里另一个节点再试
-            if _run_account(sb_kwargs, email, pwd):
-                acc_ok = True
+                _restart_proxy()
+            st = _run_account(sb_kwargs, email, pwd)
+            acc_res = st
+            if st == RENEW_PASS:
                 break
-        if acc_ok:
-            ok_count += 1
+            # 冷却/未确认不算成功，但可再换节点试试继续
+        if acc_res == RENEW_PASS:
+            renewed += 1
+            print(f"✅ 账号 {email} 续期成功")
+        elif acc_res == RENEW_COOLDOWN:
+            cooldown += 1
+            print(f"⏳ 账号 {email} 冷却中（未到续期）")
         else:
-            print(f"❌ 账号 {email} 所有节点尝试均失败")
-            send_tg_message("❌", "节点尝试均失败", f"{max_attempts} 次不同代理节点")
+            failed += 1
+            print(f"❌ 账号 {email} 未能确认续期（{acc_res}）")
+            send_tg_message("❌", "续期失败/未确认", f"{email} status={acc_res}")
 
     print("\n" + "#" * 25)
-    print(f"  全部账号处理完毕: {ok_count}/{len(ACCOUNTS)} 成功")
+    print(f"  处理完毕：续期成功 {renewed} / 冷却 {cooldown} / 失败 {failed} / 共 {len(ACCOUNTS)}")
     print("#" * 25)
-    if ok_count < len(ACCOUNTS):
+    # 只要存在「未确认/失败」（不是冷却），才让 Actions 失败报警
+    if failed > 0:
         raise SystemExit(1)
 
 if __name__ == "__main__":
