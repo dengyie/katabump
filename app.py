@@ -331,6 +331,141 @@ def _restart_proxy():
     except Exception:
         pass
 
+# Turnstile 复选框常驻于 shadow DOM（attachShadow 创建），顶部页无 iframe 时普通选择器看不到。
+# 借鉴 XCQ0607/katabump 的思路：注入 attachShadow 钩子截获 checkbox 的视口内比例，
+# 再用 CDP 原生鼠标事件在绝对坐标点击。
+_TURNSTILE_HOOK_JS = r"""
+(function(){
+  // 只在 iframe 内执行由 Playwright addInitScript 注入；此处我们不区分，主页面 shadow 也找
+  var SLOTS = '__turnstile_hook_ready';
+  try {
+    if (window[SLOTS]) return;           // 避免重复 hook
+    window[SLOTS] = true;
+    var hookShadow = (function(){
+      var orig = Element.prototype.attachShadow;
+      Element.prototype.attachShadow = function(init){
+        var root = orig.call(this, init);
+        var report = function(){
+          var cb = root.querySelector('input[type="checkbox"]');
+          if (cb){
+            var r = cb.getBoundingClientRect();
+            if (r.width>0 && r.height>0 && window.innerWidth>0 && window.innerHeight>0){
+              window.__turnstile_data = {
+                xRatio:(r.left + r.width/2)/window.innerWidth,
+                yRatio:(r.top + r.height/2)/window.innerHeight,
+                w:r.width, h:r.height
+              };
+              return true;
+            }
+          }
+          return false;
+        };
+        if(!report()){
+          var mo = new MutationObserver(function(){ if(report()) mo.disconnect(); });
+          mo.observe(root,{childList:true,subtree:true});
+        }
+        return root;
+      };
+    })();
+  } catch(e){ return false; }
+  return true;
+})()
+"""
+
+
+def _cdp(sb, cmd, params):
+    """稳健执行 CDP 命令：兼容 sb.driver.execute_cdp_cmd / sb.execute_cdp_cmd。
+    底层 Command 路径：ChromeDriver 的 SEND_COMMAND_TO_CDP。"""
+    d = sb.driver if hasattr(sb, "driver") else sb
+    if hasattr(d, "execute_cdp_cmd"):
+        return d.execute_cdp_cmd(cmd, params)
+    if hasattr(sb, "execute_cdp_cmd"):
+        return sb.execute_cdp_cmd(cmd, params)
+    # 兜底：undecored ChromeDriver 的 execute(cmd, {"cmd":.., "params":..})
+    try:
+        return d.execute("SEND_COMMAND_TO_CDP", {"cmd": cmd, "params": params})
+    except Exception:
+        return d.command_executor.execute(d._commands["SEND_COMMAND_TO_CDP"],
+                                          {"cmd": cmd, "params": params})
+
+
+def _install_turnstile_hook_cdp(sb):
+    """通过 CDP 在每个新 document 上注入 attachShadow 钩子（等价 addInitScript）。
+    须在页面导航前调用（即 uc_open_with_reconnect 之前）。"""
+    try:
+        _cdp(sb, "Page.addScriptToEvaluateOnNewDocument",
+              {"source": _TURNSTILE_HOOK_JS})
+        # 若已加载的页面也补打一次
+        try:
+            sb.driver.execute_script(_TURNSTILE_HOOK_JS)
+        except Exception:
+            pass
+        print("  ✅ 已注入 Turnstile attachShadow CDP 钩子")
+        return True
+    except Exception as e:
+        print(f"  ⚠️ 无法注入 CDP 钩子（将退回到原有策略）: {e}")
+        return False
+
+
+def _cdp_turnstile_click(sb):
+    """在“主页面”与“各 frame”里查找 __turnstile_data，随后用 CDP 原生鼠标点击复选框。
+    返回是否已发起一次原生点击（调用方自行探测 solved）。"""
+    data = None
+    try:
+        data = sb.driver.execute_script("return window.__turnstile_data || null")
+    except Exception:
+        data = None
+    # 若主 frame 未有，挨个切到子 frame 找（防跨可以选择分支）
+    if not data:
+        try:
+            for frame in sb.driver.find_elements("xpath", "//iframe"):
+                try:
+                    sb.driver.switch_to.frame(frame)
+                    data = sb.driver.execute_script("return window.__turnstile_data || null")
+                    if data:
+                        break
+                finally:
+                    sb.driver.switch_to.default_content()
+                data = None
+        except Exception:
+            data = None
+    if not data:
+        return False
+    xr = data.get("xRatio"); yr = data.get("yRatio")
+    if xr is None or yr is None:
+        return False
+    try:
+        w = sb.driver.execute_script("return window.innerWidth")
+        h = sb.driver.execute_script("return window.innerHeight")
+    except Exception:
+        return False
+    if not w or not h:
+        return False
+    # 若在子 frame 中读得比例，视口尺寸需用该 frame 的（上面切换回归 default 后已丢），此处以主尺寸近似
+    try:
+        w = sb.driver.execute_script("return window.innerWidth")
+        h = sb.driver.execute_script("return window.innerHeight")
+    except Exception:
+        return False
+    if not w or not h:
+        return False
+    cx = int(xr * w); cy = int(yr * h)
+    print(f"🖱️ [CDP] 原生点击 Turnstile 复选框 ({cx},{cy})")
+    try:
+        _cdp(sb, "Input.dispatchMouseEvent",
+             {"type": "mousePressed", "x": cx, "y": cy,
+              "button": "left", "clickCount": 1})
+        import random
+        time.sleep(0.05 + random.random() * 0.08)
+        _cdp(sb, "Input.dispatchMouseEvent",
+             {"type": "mouseReleased", "x": cx, "y": cy,
+              "button": "left", "clickCount": 1})
+        return True
+    except Exception as e:
+        print(f"  ⚠️ [CDP] 点击异常: {e}")
+        return False
+
+
 def _switch_to_turnstile_frame(sb):
     """切入页面上的 Turnstile iframe，返回是否成功。"""
     try:
@@ -356,7 +491,7 @@ def _switch_to_turnstile_frame(sb):
         return False
 
 
-#  人机验证处理（多策略：SeleniumBase UC GUI 点击 + xdotool 物理点击 + iframe 内 JS 点击）
+#  人机验证处理（多策略：CDP 原生点击 shadow 复选框 → SeleniumBase UC → xdotool → iframe 内 JS）
 def handle_turnstile(sb) -> bool:
     print("🔍 处理 Cloudflare Turnstile 验证...")
     time.sleep(2)
@@ -375,9 +510,28 @@ def handle_turnstile(sb) -> bool:
         print("✅ 已静默通过")
         return True
 
+    # ── 策略 D（新增）：CDP 原生点击 shadow DOM 内复选框 ──
+    # 顶部无 iframe 时（页面 iframe: []）普通选择器看不到 Turnstile 复选框，
+    # 由 _TURNSTILE_HOOK_JS 钩子把视口内比例写到 __turnstile_data，再 CDP 原生点击。
+    for _ in range(8):
+        if _solved():
+            print("✅ Turnstile 通过（CDP 前缀）")
+            return True
+        maybe = _cdp_turnstile_click(sb)
+        if maybe:
+            for _ in range(6):
+                if time.time() > deadline:
+                    break
+                if _solved():
+                    print("✅ Turnstile 通过（CDP 原生点击）")
+                    return True
+                time.sleep(0.6)
+        else:
+            time.sleep(1)
+        if time.time() > deadline:
+            break
+
     # 关键：cf-turnstile-response 占位元素可能先出现，真正的交互 iframe 后异步加载。
-    # 若 iframe 还没渲染就点击会落入 A/B/C 全扑空（本机观察到 页面 iframe: []）。
-    # 因此先在 open 阈值内等待 iframe 真正渲染出来。
     wait_for_iframe = 0
     while time.time() < deadline:
         try:
@@ -400,7 +554,7 @@ def handle_turnstile(sb) -> bool:
     except Exception:
         pass
 
-    # 展开 Turnstile 验证框（防止被父容器 overflow:hidden 裁剪）
+    # 展开 (防止 overflow:hidden 裁剪)
     for _ in range(3):
         try: sb.execute_script(_EXPAND_JS)
         except Exception: pass
@@ -432,7 +586,7 @@ def handle_turnstile(sb) -> bool:
             print(f"✅ Turnstile 通过（A 第 {attempt + 1} 次）")
             return True
 
-    # ── 策略 B：xdotool 物理点击复选框坐标（与 ALTCHA 同机制） ──
+    # ── 策略 B：xdotool 物理点击复选框坐标 ──
     for attempt in range(4):
         if time.time() > deadline:
             print("⏰ Turnstile 超过 55s 超时，提前结束")
@@ -454,7 +608,7 @@ def handle_turnstile(sb) -> bool:
         except Exception:
             wi = {"sx": 0, "sy": 0, "oh": 800, "ih": 768}
         bar = wi.get("oh", 800) - wi.get("ih", 768)
-        cx = bbox["x"] + wi.get("sx", 0) + 30          # 复选框在 iframe 左侧约 30px
+        cx = bbox["x"] + wi.get("sx", 0) + 30
         cy = bbox["y"] + wi.get("sy", 0) + bar + max(28, int(bbox["h"]) // 2)
         print(f"🖱️ [B] xdotool 点击复选框 ({cx}, {cy})  bbox={bbox}")
         _xdotool_click(cx, cy)
@@ -500,11 +654,9 @@ def handle_turnstile(sb) -> bool:
             })()
             """)
             if cb is not None:
-                sb.driver.execute_script(
-                    "arguments[0].focus(); arguments[0].click();", cb)
+                sb.driver.execute_script("arguments[0].focus(); arguments[0].click();", cb)
                 print("    [C] 已 click 复选框元素")
             else:
-                # 没找到复选框：尝试空格键触发
                 sb.driver.switch_to.active_element.send_keys(" ")
                 print("    [C] 未找到复选框元素，发送空格键")
         except Exception as e:
@@ -523,7 +675,7 @@ def handle_turnstile(sb) -> bool:
             print(f"✅ Turnstile 通过（C 第 {attempt + 1} 次）")
             return True
 
-    print("  ❌ Turnstile A/B/C 策略均失败")
+    print("  ❌ Turnstile A/B/C/D 策略均失败")
     return False
 
 #  账户登录
@@ -971,6 +1123,8 @@ def _run_account(sb_kwargs, email, pwd):
     print("🚀 启动浏览器...")
     try:
         with SB(**sb_kwargs) as sb:
+            # 在首次导航前注入 Turnstile attachShadow CDP 钩子（对所有后续文档生效，含登录页）
+            _install_turnstile_hook_cdp(sb)
             try:
                 sb.open("https://api.ip.sb/ip")
                 print(f"📍  当前出口IP: {sb.get_text('body')}")
