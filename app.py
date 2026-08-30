@@ -6,6 +6,7 @@ import json
 import time
 import subprocess
 import requests
+import re
 from seleniumbase import SB
 
 # 从环境变量获取账号密码和 TG 配置
@@ -824,13 +825,30 @@ def _read_page_text(sb, timeout=4):
 
 
 def _classify_renew(alert_text, page_text):
-    """权威归类续期结果。返回 (status, detail)。"""
+    """权威归类续期结果，避免把假 success 当成功。
+    成功判定需【renew/extension/renewal】+ 明确的 success/extend/complete/date 连语，
+    不能只靠页面 body 里任一 `success` 子串（易误报）。返回 (status, detail)。
+    detail 在成功时给到页面里的真实证据片段，避免只报 server-type 警告误导。"""
     body = (page_text or "") + "\n" + (alert_text or "")
     low = body.lower()
-    if any(k in low for k in ("renewed", "successfully", "success", "extended", "has been renewed")):
-        return RENEW_PASS, (alert_text or "续期成功（确认文案）")
+
+    # 成功：`renew...` 与 success/extend/complete/date 等紧邻（词级），且排除 suspended/冷却语境
+    success_pat = re.compile(
+        r"renew[a-z]*\s+(?:success[a-z]*|extend[a-z]*|complete[a-z]*|done\b|now\b)"
+        r"|renew[a-z]{0,3}\s+until\s+[^\n]{0,40}"
+        r"|renewal\s+(?:success[a-z]*|complete[a-z]*|extended?\b)"
+        r"|(?:your\s+)?server\s+has\s+been\s+renew[a-z]*",
+        re.IGNORECASE)
+    block = re.compile(r"suspend|can't renew|cannot renew|unable to renew")
+    sp = success_pat.search(low)
+    if sp and not block.search(low):
+        # 提取匹配附近作为人眼可见的证据
+        s0 = max(0, sp.start() - 40); e0 = min(len(low), sp.end() + 40)
+        ev = low[s0:e0].strip().replace("\n", " ")[:180]
+        return RENEW_PASS, (ev or alert_text or "续期成功（页面出现续期成功文案）")
+
     if "suspended" in low:
-        return RENEW_SUSPENDED, (alert_text or "服务器仍为 suspended，续期未生效")
+        return RENEW_SUSPENDED, (alert_text or "服务器仍 suspended，续期未生效")
     if "can't renew" in low or "cannot renew" in low or "unable" in low:
         return RENEW_COOLDOWN, (alert_text or "未到续期时间/冷却中")
     if "server type" in low and "startup command" in low and "reset" in low:
@@ -839,7 +857,6 @@ def _classify_renew(alert_text, page_text):
     if alert_text:
         return RENEW_UNKNOWN, alert_text
     return RENEW_UNKNOWN, "未检测到明确提示"
-
 
 def _check_renew_result(sb):
     """读取提示，判定续期是否真生效并推送 TG。返回 (status, detail)。"""
