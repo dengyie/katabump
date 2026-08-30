@@ -128,6 +128,8 @@ _SOLVED_JS = """
 """
 
 # 是否有已渲染（可见）的 Turnstile iframe（是否为真正的交互式验证框）
+# 实测：CF 非交互/auto 模式下，.cf-turnstile 内的 iframe 常以“空 src + 1x1”占位出现（src=""，w=1,h=1），
+# 并非总是 challenges.cloudflare.com 的 URL。若只按 src 判断会把真实的 1x1 iframe 漏掉，导致 uc 点击永远不触发。
 _TURNSTILE_IFRAME_JS = """
 (function(){
     var frames = document.querySelectorAll('iframe');
@@ -138,8 +140,13 @@ _TURNSTILE_IFRAME_JS = """
             if (r.width>0 && r.height>0) return true;
         }
     }
-    var q=document.querySelector('[class*="cf-turnstile"] iframe, [id*="turnstile"] iframe');
-    return !!q;
+    // 兜底：.cf-turnstile 容器内部的 iframe（含空 src 的 1x1 可见占位）即可视为“已渲染”
+    var q=document.querySelector('[class*="cf-turnstile"] iframe, [id*="turnstile"] iframe, [class*="turnstile"] iframe');
+    if (q) {
+        var qr=q.getBoundingClientRect();
+        if (qr.width>0 && qr.height>0) return true;
+    }
+    return false;
 })()
 """
 
@@ -177,12 +184,15 @@ _TURNSTILE_BBOX_JS = """
             if (r.width>0 && r.height>0) return expand(f);
         }
     }
-    // 兜底：Turnstile 组件容器内部的 iframe
+    // 兜底：Turnstile 组件容器内部的 iframe（含空 src 的 1x1 占位也要点，沿住历史可过写法）
     var q = document.querySelector(
         '[class*="cf-turnstile"] iframe, [id*="turnstile"] iframe, '+
         '[class*="turnstile"] iframe, .cf-turnstile-wrapper iframe'
     );
-    if (q) return expand(q);
+    if (q) {
+        var qr = q.getBoundingClientRect();
+        if (qr.width>0 || qr.height>0) return expand(q);
+    }
     return null;
 })()
 """
@@ -510,30 +520,32 @@ def handle_turnstile(sb) -> bool:
         print("✅ 已静默通过")
         return True
 
-    # ── 策略 D（新增）：CDP 原生点击 shadow DOM 内复选框 ──
-    # 顶部无 iframe 时（页面 iframe: []）普通选择器看不到 Turnstile 复选框，
-    # 由 _TURNSTILE_HOOK_JS 钩子把视口内比例写到 __turnstile_data，再 CDP 原生点击。
-    for _ in range(8):
+    # ── 策略 D（CDP 原生点击 shadow DOM 内复选框，快速简试，不吞噬预算）──
+    # 顶部无 iframe 时普通选择器看不到，靠 _TURNSTILE_HOOK_JS 钩子写 __turnstile_data。
+    # 仅尝试前面最多 2 次；非交互模式下钩子通常拿不到 checkbox，不应空等。
+    for _ in range(2):
         if _solved():
             print("✅ Turnstile 通过（CDP 前缀）")
             return True
         maybe = _cdp_turnstile_click(sb)
         if maybe:
-            for _ in range(6):
+            for _ in range(3):
                 if time.time() > deadline:
                     break
                 if _solved():
                     print("✅ Turnstile 通过（CDP 原生点击）")
                     return True
-                time.sleep(0.6)
+                time.sleep(0.4)
         else:
-            time.sleep(1)
+            time.sleep(0.5)
         if time.time() > deadline:
             break
 
     # 关键：cf-turnstile-response 占位元素可能先出现，真正的交互 iframe 后异步加载。
+    # 用修复后的 predicate（识别 .cf-turnstile 内空 src 的 1x1 占位 iframe），正常应 1-2s 内 break；
+    # 即便不 break，也最多等 8s，避免像以前耗尽整个 55s 预算导致策略 A 永远轮不到。
     wait_for_iframe = 0
-    while time.time() < deadline:
+    while time.time() < deadline and wait_for_iframe < 8:
         try:
             has = bool(sb.execute_script(_TURNSTILE_IFRAME_JS))
         except Exception:
@@ -544,7 +556,7 @@ def handle_turnstile(sb) -> bool:
         if wait_for_iframe % 3 == 1:
             print(f"  ⏳ 等待 Turnstile iframe 渲染... ({wait_for_iframe}s)")
         time.sleep(1)
-    else:
+    if not has:
         print(f"  ⚠️ {wait_for_iframe}s 后仍无 Turnstile iframe，改用容器兜底策略")
 
     # 记录页面 iframe 布局（诊断用）
