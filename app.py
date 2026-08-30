@@ -127,6 +127,22 @@ _SOLVED_JS = """
 })()
 """
 
+# 是否有已渲染（可见）的 Turnstile iframe（是否为真正的交互式验证框）
+_TURNSTILE_IFRAME_JS = """
+(function(){
+    var frames = document.querySelectorAll('iframe');
+    for (var i=0;i<frames.length;i++){
+        var f=frames[i]; var src=f.src||'';
+        if (src.indexOf('challenges.cloudflare.com')>-1 || src.indexOf('/turnstile/')>-1){
+            var r=f.getBoundingClientRect();
+            if (r.width>0 && r.height>0) return true;
+        }
+    }
+    var q=document.querySelector('[class*="cf-turnstile"] iframe, [id*="turnstile"] iframe');
+    return !!q;
+})()
+"""
+
 _WININFO_JS = """
 (function(){
     return {
@@ -345,10 +361,37 @@ def handle_turnstile(sb) -> bool:
     print("🔍 处理 Cloudflare Turnstile 验证...")
     time.sleep(2)
 
+    # 整体时限：避免策略全部跑完拖到 WebDriver 会话超时导致连接被重置
+    deadline = time.time() + 55
+
+    def _solved():
+        try:
+            return bool(sb.execute_script(_SOLVED_JS))
+        except Exception:
+            return False
+
     # 检查是否已静默通过
-    if sb.execute_script(_SOLVED_JS):
+    if _solved():
         print("✅ 已静默通过")
         return True
+
+    # 关键：cf-turnstile-response 占位元素可能先出现，真正的交互 iframe 后异步加载。
+    # 若 iframe 还没渲染就点击会落入 A/B/C 全扑空（本机观察到 页面 iframe: []）。
+    # 因此先在 open 阈值内等待 iframe 真正渲染出来。
+    wait_for_iframe = 0
+    while time.time() < deadline:
+        try:
+            has = bool(sb.execute_script(_TURNSTILE_IFRAME_JS))
+        except Exception:
+            has = False
+        if has:
+            break
+        wait_for_iframe += 1
+        if wait_for_iframe % 3 == 1:
+            print(f"  ⏳ 等待 Turnstile iframe 渲染... ({wait_for_iframe}s)")
+        time.sleep(1)
+    else:
+        print(f"  ⚠️ {wait_for_iframe}s 后仍无 Turnstile iframe，改用容器兜底策略")
 
     # 记录页面 iframe 布局（诊断用）
     try:
@@ -365,7 +408,10 @@ def handle_turnstile(sb) -> bool:
 
     # ── 策略 A：SeleniumBase UC 内置 GUI 点击 ──
     for attempt in range(4):
-        if sb.execute_script(_SOLVED_JS):
+        if time.time() > deadline:
+            print("⏰ Turnstile 超过 55s 时限，提前结束")
+            return False
+        if _solved():
             print(f"✅ Turnstile 通过（A 第 {attempt + 1} 次）")
             return True
         print(f"🖱️ [A] 第 {attempt + 1}/4 次调用 uc_gui_click_captcha...")
@@ -378,17 +424,20 @@ def handle_turnstile(sb) -> bool:
             print(f"⚠️ [A] 调用异常: {e}")
         solved = False
         for _ in range(8):
-            time.sleep(0.5)
-            if sb.execute_script(_SOLVED_JS):
+            if _solved():
                 solved = True
                 break
+            time.sleep(0.5)
         if solved:
             print(f"✅ Turnstile 通过（A 第 {attempt + 1} 次）")
             return True
 
     # ── 策略 B：xdotool 物理点击复选框坐标（与 ALTCHA 同机制） ──
     for attempt in range(4):
-        if sb.execute_script(_SOLVED_JS):
+        if time.time() > deadline:
+            print("⏰ Turnstile 超过 55s 超时，提前结束")
+            return False
+        if _solved():
             print("✅ Turnstile 通过（B 前缀检查）")
             return True
         bbox = None
@@ -411,10 +460,12 @@ def handle_turnstile(sb) -> bool:
         _xdotool_click(cx, cy)
         solved = False
         for _ in range(8):
-            time.sleep(0.5)
-            if sb.execute_script(_SOLVED_JS):
+            if time.time() > deadline:
+                break
+            if _solved():
                 solved = True
                 break
+            time.sleep(0.5)
         if solved:
             print(f"✅ Turnstile 通过（B 第 {attempt + 1} 次）")
             return True
@@ -422,7 +473,10 @@ def handle_turnstile(sb) -> bool:
 
     # ── 策略 C：切入 iframe 直接点击复选框元素 ──
     for attempt in range(3):
-        if sb.execute_script(_SOLVED_JS):
+        if time.time() > deadline:
+            print("⏰ Turnstile 超时，提前结束")
+            return False
+        if _solved():
             print("✅ Turnstile 通过（C 前缀检查）")
             return True
         print(f"🖱️ [C] 第 {attempt + 1}/3 切入 iframe 尝试...")
@@ -459,10 +513,12 @@ def handle_turnstile(sb) -> bool:
             sb.driver.switch_to.default_content()
         solved = False
         for _ in range(6):
-            time.sleep(1)
-            if sb.execute_script(_SOLVED_JS):
+            if time.time() > deadline:
+                break
+            if _solved():
                 solved = True
                 break
+            time.sleep(1)
         if solved:
             print(f"✅ Turnstile 通过（C 第 {attempt + 1} 次）")
             return True
