@@ -332,16 +332,21 @@ def _load_pool():
 
 
 def _build_pool_outbounds(base_out, pool_nodes):
-    """Expand an anytls base outbound into one outbound per pool node.
+    """Expand a base outbound into one outbound per pool node + urltest group.
 
-    All pool nodes share the same server domain + password; only port/SNI
-    differ. Password/fingerprint comes from the PROXY_URL credentials.
+    Works for anytls AND http/socks/residential proxies:
+    - each pool node carries its own server + port (residential pool) or only port (shared anytls)
+    - credentials (password/fingerprint) come from the base outbound / PROXY_URL secrets
+    - pool.json must hold NO passwords (public repo safe).
     """
     outbounds = []
     for i, node in enumerate(pool_nodes, 1):
         ob = json.loads(json.dumps(base_out))  # deep copy
         ob["tag"] = f"node-{i}"
-        ob["server_port"] = int(node["port"])
+        if node.get("port"):
+            ob["server_port"] = int(node["port"])
+        if node.get("server"):
+            ob["server"] = node["server"]
         if node.get("sni"):
             ob.setdefault("tls", {}).setdefault("enabled", True)
             ob["tls"]["server_name"] = node["sni"]
@@ -393,10 +398,10 @@ def main():
             print(f"Unsupported protocol: {scheme}")
             sys.exit(1)
 
-    # If the base proxy is anytls and a pool.json exists, expand into
-    # multiple node outbounds + a urltest group (auto-pick a reachable node).
+    # 若 base proxy 有 pool.json，展开成多节点 + urltest 组（自动挑可达/最快节点）。
+    # 适用于 anytls，以及住宅代理 http/socks（residential pool，避免单点挂）。
     outbounds = [outbound, {"type": "direct", "tag": "direct"}]
-    if scheme == "anytls":
+    if scheme in ("anytls", "http", "https", "socks5", "socks", "https"):
         pool = _load_pool()
         if pool:
             node_obs = _build_pool_outbounds(outbound, pool)
