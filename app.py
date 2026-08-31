@@ -801,8 +801,8 @@ def _goto_server_detail(sb) -> bool:
     alert_text = _read_alert(sb)
     if alert_text and "can't renew" in alert_text.lower():
         print(f"ℹ️  页面顶部提示: {alert_text}")
-        send_tg_message("ℹ️", "⚠️ 未到续期时间", alert_text)
-        return False
+        # 冷却期：返回 cooldown 而非 unknown，让 main 停止重试并只发一条冷却通知
+        return "cooldown"
 
     # 多种选择器尝试查找 See 链接
     selectors = [
@@ -1094,7 +1094,8 @@ def _classify_renew(alert_text, page_text):
     return RENEW_UNKNOWN, "未检测到明确提示"
 
 def _check_renew_result(sb):
-    """读取提示，判定续期是否真生效并推送 TG。返回 (status, detail)。"""
+    """读取提示，判定续期是否真生效。返回 (status, detail)。
+    （不再在每个节点尝试内发 TG；由 main 对每个账号统一发一条汇总消息，避免冷却/失败时重复推送）"""
     print("\n📋 检查续期结果...")
     alert_text = _read_alert(sb)
     if not alert_text:
@@ -1103,18 +1104,6 @@ def _check_renew_result(sb):
     page_text = _read_page_text(sb)
     status, detail = _classify_renew(alert_text, page_text)
     print(f"📩 页面提示: {detail}")
-    if status == RENEW_PASS:
-        send_tg_message("✅", "续期成功", detail)
-    elif status == RENEW_COOLDOWN:
-        nd, ndays = _next_renewable((alert_text or "") + " " + page_text)
-        extra = f" | 下次可续: {nd} ({ndays}天后)" if (nd or ndays) else ""
-        send_tg_message("⏳", "未到续期时间（冷却中）", (detail or "") + extra)
-    elif status == RENEW_SUSPENDED:
-        send_tg_message("❌", "服务器已 suspended", detail)
-    elif status == RENEW_UNCONFIRMED:
-        send_tg_message("⚠️", "续期未确认，需人工核对", detail)
-    else:
-        send_tg_message("ℹ️", "续期结果：无法确认", detail)
     return status, detail
 
 
@@ -1125,7 +1114,10 @@ def renew_server(sb):
     print("  开始自动续期流程")
     print("#" * 25)
 
-    if not _goto_server_detail(sb):
+    gs = _goto_server_detail(sb)
+    if gs == "cooldown":
+        return {"status": RENEW_COOLDOWN, "detail": "未到续期时间（页面提示 can't renew）", "before": ""}
+    if not gs:
         return {"status": RENEW_UNKNOWN, "detail": "未能进入详情页"}
 
     before = _read_page_text(sb)[:500]
@@ -1144,7 +1136,8 @@ def renew_server(sb):
 
 def _run_account(sb_kwargs, email, pwd):
     """单个账号：启动浏览器 -> 登录 -> 自动续期。
-    返回 status ∈ RENEW_*。RENEW_PASS 才算真续上；RENEW_COOLDOWN 为合法冷却；其余未确认为失败。"""
+    返回 (status, detail)。status ∈ RENEW_*：RENEW_PASS 才算真续上；RENEW_COOLDOWN 为合法冷却；其余未确认为失败。
+    detail 用于最终发一条汇总 TG，避免每次节点尝试重复推送。"""
     global CURRENT_EMAIL
     CURRENT_EMAIL = email
     print("🚀 启动浏览器...")
@@ -1160,17 +1153,16 @@ def _run_account(sb_kwargs, email, pwd):
 
             if not login(sb, email, pwd):
                 print("\n❌ 登录失败，终止该账号续期操作。")
-                send_tg_message("❌", "登录失败", "未知")
-                return RENEW_UNKNOWN
+                return (RENEW_UNKNOWN, "登录失败")
 
             res = renew_server(sb)
             st = res.get("status", RENEW_UNKNOWN) if isinstance(res, dict) else RENEW_UNKNOWN
+            detail = res.get("detail", "") if isinstance(res, dict) else ""
             print(f"ℹ️  账号 {email} 续期状态: {st}")
-            return st
+            return (st, detail)
     except Exception as e:
         print(f"\n❌ 账号 {email} 处理异常: {e}")
-        send_tg_message("❌", f"处理异常: {e}", "未知")
-        return RENEW_UNKNOWN
+        return (RENEW_UNKNOWN, f"处理异常: {e}")
 
 #  脚本执行入口 (可选代理)
 def main():
@@ -1206,25 +1198,33 @@ def main():
         print("=" * 25)
 
         acc_res = RENEW_UNKNOWN
+        acc_detail = ""
         for attempt in range(1, max_attempts + 1):
             print(f"  ── 节点尝试 {attempt}/{max_attempts} ──")
             if attempt > 1:
                 _restart_proxy()
-            st = _run_account(sb_kwargs, email, pwd)
+            st, detail = _run_account(sb_kwargs, email, pwd)
             acc_res = st
+            acc_detail = detail or acc_detail
             if st == RENEW_PASS:
                 break
-            # 冷却/未确认不算成功，但可再换节点试试继续
+            if st == RENEW_COOLDOWN:
+                # 冷却期是终结态：重试也不会变成可续，直接结束，避免 3 次重复尝试与重复通知
+                break
+            # 未确认/失败：可再换节点试（后续详尽看）。
         if acc_res == RENEW_PASS:
             renewed += 1
             print(f"✅ 账号 {email} 续期成功")
+            send_tg_message("✅", "续期成功", acc_detail or "续期成功")
         elif acc_res == RENEW_COOLDOWN:
             cooldown += 1
             print(f"⏳ 账号 {email} 冷却中（未到续期）")
+            # 统一只发一条冷却通知（此前每个节点尝试都发，导致一天/一次 run 重复刷屏）
+            send_tg_message("⏳", "未到续期时间（冷却中）", (acc_detail or "未到续期") + f" | 账户 {email}")
         else:
             failed += 1
             print(f"❌ 账号 {email} 未能确认续期（{acc_res}）")
-            send_tg_message("❌", "续期失败/未确认", f"{email} status={acc_res}")
+            send_tg_message("❌", "续期失败/未确认", f"{email} status={acc_res} | {acc_detail}")
 
     print("\n" + "#" * 25)
     print(f"  处理完毕：续期成功 {renewed} / 冷却 {cooldown} / 失败 {failed} / 共 {len(ACCOUNTS)}")
