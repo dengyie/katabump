@@ -2,13 +2,11 @@
   {"name": "Frontier-US-1", "server": "104.251.93.55", "port": 16062},
   {"name": "Frontier-US-2", "server": "104.251.93.22", "port": 16062},
   {"name": "Frontier-US-3", "server": "104.218.199.24", "port": 16062},
-  {"name": "Frontier-US-4", "server": "172.85.99.63", "port": 16062},
   {"name": "Telmex-CO", "server": "200.118.71.12", "port": 8080},
   {"name": "Transtelco-MX", "server": "187.249.37.227", "port": 2024},
   {"name": "COMIFIBRA-MX", "server": "189.51.168.167", "port": 999},
   {"name": "Velico-HN", "server": "200.115.189.145", "port": 9096},
   {"name": "Alestra-MX", "server": "148.244.144.194", "port": 8097},
   {"name": "Airtime-DO", "server": "181.232.190.121", "port": 999},
-  {"name": "Amanah-CA", "server": "184.75.221.82", "port": 3118},
   {"name": "Dstny-BE", "server": "87.237.15.239", "port": 7080}
 ]
