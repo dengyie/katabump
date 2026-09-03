@@ -1020,17 +1020,20 @@ RENEW_UNKNOWN = "unknown"
 
 
 def _next_renewable(text):
-    """从文案提取『as of <date>(in N day(s))』或『in N day(s)』中的下次可续日期/天数。返回 (日期,天数)"""
+    """从文案提取『as of <date>(in N day(s))』或『in N day(s)』中的下次可续日期/天数。
+    返回 (日期,天数)。优先精确抓 as of <date> (in N day(s))；失败再退化为裸 in N day。"""
     import re as _re
     low = (text or "").lower()
-    m = _re.search(r"as of\s+([^\n().]{2,40}?)(?:\s*\(in[\s]*(\d+)[^)]*days?\))?", low)
+    m = _re.search(r"as of\s+([^\n()]{2,60}?)\s*\(\s*in\s*(\d+)\s*day", low)
     if m:
-        return m.group(1).strip(), (int(m.group(2)) if m.group(2) else None)
+        return m.group(1).strip(), int(m.group(2))
+    m3 = _re.search(r"as of\s+([^\n()]{2,60}?)(?:\(|\s|$)", low)
+    if m3:
+        return m3.group(1).strip(), None
     m2 = _re.search(r"in\s*(\d+)\s*day", low)
     if m2:
         return None, int(m2.group(1))
     return None, None
-
 
 def _read_page_text(sb, timeout=4):
     """读整页正文，续期结果判定不只看单条 div.alert"""
@@ -1072,23 +1075,24 @@ def _classify_renew(alert_text, page_text):
     if "can't renew" in low or "cannot renew" in low or "unable" in low:
         return RENEW_COOLDOWN, (alert_text or "未到续期时间/冷却中")
     if "server type" in low and "startup command" in low and "reset" in low:
-        # 历史里这条是续期弹出在提交后被当成‘成功’的地址（实际未显示 success 文案）。
-        # 方案A：提交+ALT值已走完，页面只剩 server-type 警告而无显式 failure —— 且账号未到期时，
-        # 这属于“冷却期/已续”的正常情况，归为 cooldown(绿 ⏳)，不再把每天 schedule 标红；
-        # 只有检测到期日已在过去/剩余 0 天（真正逾期没续上）才保留红标（unconfirmed）让人工核对。
+        # ⚠️ 关键教训（2026-09-03 suspend 事故）：这条 static 警告出现【不代表】续上。
+        # 09-01/09-02 只因页面只剩这条警告、无显式 success 也无 can\'t-renew 冷却文案，
+        # 代码把 server-type 分支无脑归 cooldown(绿)——结果服务器在 09-03 真被 suspend。
+        # 硬核取向（用户拍板：只在乎能否真续上，宁红不假绿）：
+        #   只有【明确拿到可续日期充足】才绿；否则一律 unconfirmed(红) 逼人工核对。
         if "suspended" in low:
-            return RENEW_SUSPENDED, (alert_text or "服务器仍 suspended，续期未生效")
+            return RENEW_SUSPENDED, (alert_text or "服务器已 suspend 续期未生效")
         nd, n = _next_renewable(body)
-        overdue = False
-        if n is not None and n <= 0:
-            overdue = True
+        # 无显式天数信息 → 存疑，红标，不要猜绿
         if nd is None and n is None:
-            # 文案没有给下次可续/剩余天数：视为已续或冷却的正常提交（账号健康场景）
-            return RENEW_COOLDOWN, (alert_text or "仅 server type 警告，无失败提示：视为已续/冷却")
-        if overdue:
-            return RENEW_UNCONFIRMED, (alert_text or "到期日已过/剩余 0 天，仍需人工核对续期")
-        extra = f"下次可续: {nd}" if nd else (f"{n} 天后" if n else "")
-        return RENEW_COOLDOWN, (alert_text or f"仅 server type 警告；下次可续 {extra}（冷却期，未到续期窗口）")
+            return RENEW_UNCONFIRMED, (alert_text or "仅 server type 警告、无续期成功确认，未确认续上，需人工核对")
+        # 明确给了剩余天数
+        if n is not None:
+            if n <= 2:
+                return RENEW_UNCONFIRMED, (alert_text or f"仅 server type 警告；剩余约 {n} 天，临近到期未确认续上，需人工核对")
+            return RENEW_COOLDOWN, (alert_text or f"仅 server type 警告；剩余约 {n} 天（冷却期）")
+        # 只有日期、无天数：保守按未确认
+        return RENEW_UNCONFIRMED, (alert_text or f"仅 server type 警告；下次可续 {nd}，未确认续期成功")
     if alert_text:
         return RENEW_UNKNOWN, alert_text
     return RENEW_UNKNOWN, "未检测到明确提示"
