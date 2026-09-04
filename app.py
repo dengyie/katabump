@@ -1069,6 +1069,17 @@ def _save_state(email, expiry_iso):
         print(f"⚠️ 状态写入失败（不影响续期）: {e}")
 
 
+def _ensure_state_file():
+    """确保状态下文件存在（若从未写入则写空 {}），让 actions/cache/save 始终有文件可存，
+    消除冷却期未 PASS 时「Path do not exist, no cache saved」warning。不抛错。"""
+    try:
+        if not os.path.exists(STATE_FILE):
+            with open(STATE_FILE, "w") as f:
+                json.dump({}, f)
+    except Exception as e:
+        print(f"⚠️ 状态文件初始化失败（不影响续期）: {e}")
+
+
 def _days_until_next_renewable(email):
     """[根因] 根据状态文件里的上次 expiry 估算距下次可续天数。
     返回剩余天数（可续触发 0）；无状态/损坏/已过期 → 返回 None（fail-open，走完整流程）。"""
@@ -1445,6 +1456,9 @@ def main():
             cooldown += 1
             extra = f"剩 {acc_rdays} 天" if acc_rdays is not None else "天数未知"
             print(f"⏳ 账号 {email} 本次未触发告警（{acc_res}，{extra}）：{acc_detail or ''}")
+
+    # 确保状态文件存在（即使冷却期未写入任何 expiry），供 actions/cache/save 有文件可存
+    _ensure_state_file()
 
     print("\n" + "#" * 25)
     print(f"  处理完毕：续期成功 {renewed} / 无告警(冷却/未确认) {cooldown} / 需处理失败 {failed} / 共 {len(ACCOUNTS)}")
