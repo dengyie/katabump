@@ -1194,6 +1194,20 @@ def _classify_renew(alert_text, page_text):
         return RENEW_UNKNOWN, alert_text, None
     return RENEW_UNKNOWN, "未检测到明确提示", None
 
+def _merge_result(cur_st, cur_rd, new_st, new_rd):
+    """[根因] 多节点尝试结果合并：按严肃度优先级取结论，且绝不因瞬态 unknown 覆盖已确证健康。
+    优先级：suspended(5) > pass(4) > cooldown(3) > unconfirmed(2) > unknown(1)。
+    返回 (status, remaining_days)。
+    背景（09-04 实锤）：节点1/2 都登录成功/冷却 unconfirmed（确证服务器健康），
+    节点3 瞬态登录失败 unknown，若“最后节点说了算”会把整轮误刷成红。
+    修复：unknown 最低，仅在整轮从未确证任何健康时才保留；真 suspended 仍恒最高硬红。
+    """
+    _RANK = {RENEW_UNKNOWN: 1, RENEW_UNCONFIRMED: 2, RENEW_COOLDOWN: 3, RENEW_PASS: 4, RENEW_SUSPENDED: 5}
+    if _RANK[new_st] >= _RANK[cur_st]:
+        return new_st, new_rd
+    return cur_st, cur_rd
+
+
 def _check_renew_result(sb):
     """读取提示，判定续期是否真生效。返回 (status, detail, remaining_days)。
     （不再在每个节点尝试内发 TG；由 main 对每个账号统一发一条汇总消息，避免冷却/失败时重复推送）"""
@@ -1397,10 +1411,11 @@ def main():
                 if attempt > 1:
                     _restart_proxy()
                 st, detail, rdays = _run_account(sb_kwargs, email, pwd)
-                if rdays is not None:
-                    acc_rdays = rdays
-                acc_res = st
-                acc_detail = detail or acc_detail
+                # 按严肃度合并（见 _merge_result）：已知瞬态 unknown 不覆盖已确证健康/冷却
+                _prev = acc_res
+                acc_res, acc_rdays = _merge_result(acc_res, acc_rdays, st, rdays)
+                if acc_res != _prev and acc_res != RENEW_UNKNOWN:
+                    acc_detail = detail or acc_detail
                 if st == RENEW_PASS:
                     # 续期成功：尝试记录新 expiry，供后续 run 冷却期跳过
                     exp = _extract_expiry(detail)

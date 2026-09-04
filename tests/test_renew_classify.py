@@ -45,6 +45,31 @@ def ok(cond, label):
 
 SUSPEND_BODY = "Your server is suspended because you did not renew it in time. You can still renew it."
 
+# ---- 多节点结果合并 `_merge_result`（根因回归：09-04 实锤节点3 unknown 误覆盖冷却）----
+mr = app._merge_result
+_Rsus = app.RENEW_SUSPENDED
+# 09-04 核心回归：冷却之后瞬态 unknown → 必须保持冷却，不刷红
+ok(mr(RENEW_COOLDOWN, None, app.RENEW_UNKNOWN, None) == (RENEW_COOLDOWN, None),
+   "冷却 → 瞬态unknown: 保持冷却(不刷红)[09-04回归]")
+# unknown 先进、后 cooldown → 升级为 cooldown
+ok(mr(app.RENEW_UNKNOWN, None, RENEW_COOLDOWN, None) == (RENEW_COOLDOWN, None),
+   "unknown → cooldown: 升级冷却")
+# suspended 恒最高：无论之前是什么都硬红
+ok(mr(RENEW_COOLDOWN, None, _Rsus, None)[0] == _Rsus, "任何 → suspended: 恒硬红")
+ok(mr(app.RENEW_UNKNOWN, None, _Rsus, None)[0] == _Rsus, "unknown → suspended: 硬红")
+# pass 高于 unconfirmed
+ok(mr(RENEW_UNCONFIRMED, None, RENEW_PASS, None)[0] == RENEW_PASS, "unconfirmed → pass: 升为成功")
+# 同级保持先
+ok(mr(RENEW_COOLDOWN, 7, RENEW_COOLDOWN, 5) == (RENEW_COOLDOWN, 5), "同冷却: 采纳较新 rdays(5)")
+ok(mr(RENEW_COOLDOWN, 5, RENEW_COOLDOWN, 7) == (RENEW_COOLDOWN, 7), "同冷却: 采纳较新 rdays(7)")
+# unconfirmed 不被后续 unknown 覆盖
+ok(mr(RENEW_UNCONFIRMED, None, app.RENEW_UNKNOWN, None) == (RENEW_UNCONFIRMED, None), "unconfirmed → unknown: 不降")
+# 三重：cool→unconfirmed→unknown 最终仍冷却（全健康不刷红）
+ok(mr(mr(RENEW_COOLDOWN, None, RENEW_UNCONFIRMED, None)[0], None, app.RENEW_UNKNOWN, None)[0] == RENEW_COOLDOWN,
+   "三重冲突最终冷却(不刷红)")
+
+print("✅ 合并 `_merge_result` 测试通过 (9 项)")
+
 ok(_classify_renew("", "your server has been renewed successfully. new expiry 2026-09-16")[0] == RENEW_PASS,
    "真续期成功 → ok")
 ok(_classify_renew(SRV_WARN, "")[0] == RENEW_UNCONFIRMED,
@@ -167,4 +192,4 @@ ok(_alert_action(app.RENEW_PASS, None)[2] is False
    and _alert_action(app.RENEW_PASS, None)[0] == "✅", "PASS → ✅通知(非告警)")
 
 print("\n✅ 告警决策 `_alert_action` 测试通过 (10 项)")
-print("\n✅✅ 全部测试通过 (15 + 10 + 6 + 12 = 43/43)")
+print("\n✅✅ 全部测试通过 (15 + 10 + 6 + 12 + 9 = 52/52)")
