@@ -1018,6 +1018,93 @@ RENEW_SUSPENDED = "suspended"
 RENEW_UNCONFIRMED = "unconfirmed"
 RENEW_UNKNOWN = "unknown"
 
+MAX_CONFIRMED_ALERT_DAYS = 2   # 小于等于该天数、且未确认续上 → 视为临近到期，红告警
+
+# 续期状态文件（记录每个账号上次成功续期后的 expiry，用于冷却期跳过 Renew 流程；
+# 由 GitHub Actions cache 跨 run 持久化；缺失/损坏一律 fail-open 走完整流程）
+STATE_FILE = os.environ.get("RENEW_STATE_FILE", "renew_state.json")
+
+
+def _parse_date(s):
+    """解析 YYYY-MM-DD / YYYY/MM/DD / '11 August 2026' 等日期 → datetime.date；失败 None。"""
+    from datetime import datetime
+    s = (s or "").strip()
+    if not s:
+        return None
+    for fmt in ("%Y-%m-%d", "%Y/%m/%d", "%d %B %Y", "%d %b %Y", "%B %d, %Y", "%b %d, %Y"):
+        try:
+            return datetime.strptime(s, fmt).date()
+        except Exception:
+            continue
+    import re as _re
+    m = _re.search(r"(\d{4})[\-/](\d{1,2})[\-/](\d{1,2})", s)
+    if m:
+        try:
+            from datetime import date
+            return date(int(m.group(1)), int(m.group(2)), int(m.group(3)))
+        except Exception:
+            pass
+    return None
+
+
+def _load_state():
+    """读状态文件（fail-open：缺失/损坏 → {}）。"""
+    try:
+        with open(STATE_FILE) as f:
+            d = json.load(f)
+            return d if isinstance(d, dict) else {}
+    except Exception:
+        return {}
+
+
+def _save_state(email, expiry_iso):
+    """写入单个账号的 expiry（YYYY-MM-DD）。失败不抛错。"""
+    try:
+        d = _load_state()
+        d[email] = expiry_iso
+        with open(STATE_FILE, "w") as f:
+            json.dump(d, f)
+        print(f"💾 已记录 {email} 新到期日: {expiry_iso}")
+    except Exception as e:
+        print(f"⚠️ 状态写入失败（不影响续期）: {e}")
+
+
+def _days_until_next_renewable(email):
+    """[根因] 根据状态文件里的上次 expiry 估算距下次可续天数。
+    返回剩余天数（可续触发 0）；无状态/损坏/已过期 → 返回 None（fail-open，走完整流程）。"""
+    iso = _load_state().get(email)
+    if not iso:
+        return None
+    from datetime import datetime, timedelta
+    try:
+        exp = datetime.strptime(str(iso)[:10], "%Y-%m-%d").date()
+    except Exception:
+        return None
+    if exp <= (datetime.now().date()):
+        return None                       # 到期窗口（含已过期）→ 必须尝试 Renew
+    return (exp - datetime.now().date()).days
+
+
+def _extract_expiry(detail):
+    """从续期成功的 detail 证据里提取新到期日（renew until/extended until/expires ... 等）。
+    返回 datetime.date 或 None。"""
+    if not detail:
+        return None
+    import re as _re
+    # 优先 after；再 任意 YYYY-MM-DD
+    for kw in (r"until\s+([^,.;]{2,40})", r"till\s+([^,.;]{2,40})", r"expires?\s+([^,.;]{2,40})", r"(?<!to\s)to\s+([^,.;]{2,40})"):
+        m = re.search(kw, detail, re.IGNORECASE)
+        if m:
+            d = _parse_date(m.group(1).strip())
+            if d:
+                return d
+    m = re.search(r"(\d{4})[\-/](\d{1,2})[\-/](\d{1,2})", detail)
+    if m:
+        d = _parse_date(m.group(0))
+        if d:
+            return d
+    return None
+
 
 def _next_renewable(text):
     """从文案提取『as of <date>(in N day(s))』或『in N day(s)』中的下次可续日期/天数。
@@ -1050,7 +1137,10 @@ def _read_page_text(sb, timeout=4):
 def _classify_renew(alert_text, page_text):
     """权威归类续期结果，避免把假 success 当成功。
     成功判定需【renew/extension/renewal】+ 明确的 success/extend/complete/date 连语，
-    不能只靠页面 body 里任一 `success` 子串（易误报）。返回 (status, detail)。
+    不能只靠页面 body 里任一 `success` 子串（易误报）。
+    返回 (status, detail, remaining_days)：
+      - remaining_days: 距下次可续天数（从页面 as of ... (in N day) 精确抓取；未知返回 None）。
+        由 main 结合它区分「临近到期需人工核对」vs「健康冷却不必告警」。
     detail 在成功时给到页面里的真实证据片段，避免只报 server-type 警告误导。"""
     body = (page_text or "") + "\n" + (alert_text or "")
     low = body.lower()
@@ -1068,37 +1158,44 @@ def _classify_renew(alert_text, page_text):
         # 提取匹配附近作为人眼可见的证据
         s0 = max(0, sp.start() - 40); e0 = min(len(low), sp.end() + 40)
         ev = low[s0:e0].strip().replace("\n", " ")[:180]
-        return RENEW_PASS, (ev or alert_text or "续期成功（页面出现续期成功文案）")
+        return RENEW_PASS, (ev or alert_text or "续期成功（页面出现续期成功文案）"), None
 
     if "suspended" in low:
-        return RENEW_SUSPENDED, (alert_text or "服务器仍 suspended，续期未生效")
+        return RENEW_SUSPENDED, (alert_text or "服务器仍被 suspend，需手动处理"), None
     if "can't renew" in low or "cannot renew" in low or "unable" in low:
-        return RENEW_COOLDOWN, (alert_text or "未到续期时间/冷却中")
+        nd, n = _next_renewable(body)
+        # 裸「unable」过宽：可能是真·无法续期的错误文案（如 unable to renew），
+        # 若归 COOLDOWN 会在新告警逻辑下被静默（误隐真问题）。只有给出明确冷却天数/日期
+        # 才认定是健康冷却期；否则按 UNKNOWN 告警，让用户确认。
+        if (nd is None and n is None):
+            return RENEW_UNKNOWN, (alert_text or "未能续期且无明确冷却信息，需人工核对"), None
+        return RENEW_COOLDOWN, (alert_text or "未到续期时间/冷却中"), n
     if "server type" in low and "startup command" in low and "reset" in low:
         # ⚠️ 关键教训（2026-09-03 suspend 事故）：这条 static 警告出现【不代表】续上。
-        # 09-01/09-02 只因页面只剩这条警告、无显式 success 也无 can\'t-renew 冷却文案，
+        # 09-01/09-02 只因页面只剩这条警告、无显式 success 也无 can't-renew 冷却文案，
         # 代码把 server-type 分支无脑归 cooldown(绿)——结果服务器在 09-03 真被 suspend。
-        # 硬核取向（用户拍板：只在乎能否真续上，宁红不假绿）：
-        #   只有【明确拿到可续日期充足】才绿；否则一律 unconfirmed(红) 逼人工核对。
+        # 硬核取向（用户拍板：只认真续上，宁红不假绿）→ 分类【保持】无 success 一律 UNCONFIRMED。
+        # 但告警与否交给 main 结合 remaining_days 决策：真死( suspend )/临到期(≤2天)才红告警；
+        # 健康冷却期（无天数/天数≥3）静默不吵（详见 main() 的告警决策表）。
         if "suspended" in low:
-            return RENEW_SUSPENDED, (alert_text or "服务器已 suspend 续期未生效")
+            return RENEW_SUSPENDED, (alert_text or "服务器已 suspend，需手动续"), None
         nd, n = _next_renewable(body)
-        # 无显式天数信息 → 存疑，红标，不要猜绿
+        # 无显式天数信息 → 存疑，仍判 unconfirmed（防 09-03 假绿）；是否红告警交给 main
         if nd is None and n is None:
-            return RENEW_UNCONFIRMED, (alert_text or "仅 server type 警告、无续期成功确认，未确认续上，需人工核对")
+            return RENEW_UNCONFIRMED, (alert_text or "仅 server type 警告、无续期成功提示，未确认续上，按需核对"), None
         # 明确给了剩余天数
         if n is not None:
-            if n <= 2:
-                return RENEW_UNCONFIRMED, (alert_text or f"仅 server type 警告；剩余约 {n} 天，临近到期未确认续上，需人工核对")
-            return RENEW_COOLDOWN, (alert_text or f"仅 server type 警告；剩余约 {n} 天（冷却期）")
+            if n <= MAX_CONFIRMED_ALERT_DAYS:
+                return RENEW_UNCONFIRMED, (alert_text or f"仅 server type 警告；剩约 {n} 天，临近到期未确认续上，需人工核对"), n
+            return RENEW_COOLDOWN, (alert_text or f"仅 server type 警告；剩约 {n} 天（冷却期）"), n
         # 只有日期、无天数：保守按未确认
-        return RENEW_UNCONFIRMED, (alert_text or f"仅 server type 警告；下次可续 {nd}，未确认续期成功")
+        return RENEW_UNCONFIRMED, (alert_text or f"仅 server type 警告；下次可续 {nd}，未确认续期成功"), None
     if alert_text:
-        return RENEW_UNKNOWN, alert_text
-    return RENEW_UNKNOWN, "未检测到明确提示"
+        return RENEW_UNKNOWN, alert_text, None
+    return RENEW_UNKNOWN, "未检测到明确提示", None
 
 def _check_renew_result(sb):
-    """读取提示，判定续期是否真生效。返回 (status, detail)。
+    """读取提示，判定续期是否真生效。返回 (status, detail, remaining_days)。
     （不再在每个节点尝试内发 TG；由 main 对每个账号统一发一条汇总消息，避免冷却/失败时重复推送）"""
     print("\n📋 检查续期结果...")
     alert_text = _read_alert(sb)
@@ -1106,42 +1203,81 @@ def _check_renew_result(sb):
         time.sleep(3)
         alert_text = _read_alert(sb)
     page_text = _read_page_text(sb)
-    status, detail = _classify_renew(alert_text, page_text)
+    status, detail, remaining_days = _classify_renew(alert_text, page_text)
     print(f"📩 页面提示: {detail}")
-    return status, detail
+    return status, detail, remaining_days
+
+
+def _probe_cooldown_text(page_text):
+    """[根因] 纯函数：从详情页正文判断是否处于冷却期（未到续期窗口）。
+    返回 (in_cooldown, remaining_days)。只有「冷却文案 + 明确截止天数(N)」才判定为合法冷却期；
+    裸 unable / 任意文案不算，避免把真失败当冷却。"""
+    low = (page_text or "").lower()
+    if ("can't renew" in low or "cannot renew" in low or "unable to renew" in low) \
+            and "in" in low and "day" in low:
+        _, n = _next_renewable(low)
+        if n is not None:
+            return True, n
+    return False, None
+
+
+def _probe_cooldown(sb):
+    """[根因修复] wrapper：读详情页正文 → 判断是否冷却期。
+    若未到续期窗口 → (True, remaining_days)；否则 (False, None)。
+
+    为什么必需：旧流程无视冷却、无条件点 Renew→ALTCHA→Submit，页后端在冷却期只回
+    server-type 静态警告（dengyie 面板 div.alert），必然被 `_classify_renew` 判 `unconfirmed`
+    ——正是「健康冷却期却每天红刷屏」的**根因**。在此提前探测冷却并从源头结束，
+    冷却期不再触发无谓的 Renew 流程，从根上消除 unconfirmed 噪声；
+    仅靠告警分类去静默是“标点掩盖噪声”，治标。此探测作源头，配合告警分类做兜底。
+    """
+    try:
+        page_text = _read_page_text(sb)
+    except Exception:
+        page_text = ""
+    in_cooldown, n = _probe_cooldown_text(page_text)
+    if in_cooldown:
+        print(f"⏳ [根系] 冷却期，剩余约 {n} 天，跳过 Renew 流程。")
+    return in_cooldown, n
 
 
 def renew_server(sb):
-    """登录成功后调用：自动进入详情页 -> Renew -> ALTCHA -> 提交。
-    返回 dict(status, detail, before)：只有 status==RENEW_PASS 才算真续上。"""
+    """登录成功后调用：自动进入详情页 -> 检测冷却（源头） -> Renew -> ALTCHA -> 提交。
+    返回 dict(status, detail, before, remaining_days)：只有 status==RENEW_PASS 才算真续上。
+    remaining_days 用于 main 决定是否告警（临近到期才红）。"""
     print("\n" + "#" * 25)
     print("  开始自动续期流程")
     print("#" * 25)
 
     gs = _goto_server_detail(sb)
     if gs == "cooldown":
-        return {"status": RENEW_COOLDOWN, "detail": "未到续期时间（页面提示 can't renew）", "before": ""}
+        return {"status": RENEW_COOLDOWN, "detail": "未到续期时间（页面提示 can't renew）", "before": "", "remaining_days": None}
     if not gs:
-        return {"status": RENEW_UNKNOWN, "detail": "未能进入详情页"}
+        return {"status": RENEW_UNKNOWN, "detail": "未能进入详情页", "before": "", "remaining_days": None}
 
     before = _read_page_text(sb)[:500]
 
+    # [根因] 在点 Renew 前先探测冷却：若在冷却期直接结束，不再触发 Renew 流程（源头消除 unconfirmed）
+    in_cooldown, cooldown_days = _probe_cooldown(sb)
+    if in_cooldown:
+        return {"status": RENEW_COOLDOWN, "detail": "冷却期，未到续期窗口", "before": before, "remaining_days": cooldown_days}
+
     if not _open_renew_modal(sb):
-        return {"status": RENEW_UNKNOWN, "detail": "未弹 Renew 模态框"}
+        return {"status": RENEW_UNKNOWN, "detail": "未弹 Renew 模态框", "before": before, "remaining_days": None}
 
     altcha_ok = _solve_altcha(sb)
     if not altcha_ok:
         print("⚠️ ALTCHA 验证未通过，仍尝试提交 Renew...")
 
     _submit_renew(sb)
-    status, detail = _check_renew_result(sb)
-    return {"status": status, "detail": detail, "before": before}
+    status, detail, remaining_days = _check_renew_result(sb)
+    return {"status": status, "detail": detail, "before": before, "remaining_days": remaining_days}
 
 
 def _run_account(sb_kwargs, email, pwd):
     """单个账号：启动浏览器 -> 登录 -> 自动续期。
-    返回 (status, detail)。status ∈ RENEW_*：RENEW_PASS 才算真续上；RENEW_COOLDOWN 为合法冷却；其余未确认为失败。
-    detail 用于最终发一条汇总 TG，避免每次节点尝试重复推送。"""
+    返回 (status, detail, remaining_days)。status ∈ RENEW_*。
+    remaining_days：距下次可续天数（未知 None），供 main 决定是否告警。"""
     global CURRENT_EMAIL
     CURRENT_EMAIL = email
     print("🚀 启动浏览器...")
@@ -1157,18 +1293,43 @@ def _run_account(sb_kwargs, email, pwd):
 
             if not login(sb, email, pwd):
                 print("\n❌ 登录失败，终止该账号续期操作。")
-                return (RENEW_UNKNOWN, "登录失败")
+                return (RENEW_UNKNOWN, "登录失败", None)
 
             res = renew_server(sb)
             st = res.get("status", RENEW_UNKNOWN) if isinstance(res, dict) else RENEW_UNKNOWN
             detail = res.get("detail", "") if isinstance(res, dict) else ""
+            rdays = res.get("remaining_days") if isinstance(res, dict) else None
             print(f"ℹ️  账号 {email} 续期状态: {st}")
-            return (st, detail)
+            return (st, detail, rdays)
     except Exception as e:
         print(f"\n❌ 账号 {email} 处理异常: {e}")
-        return (RENEW_UNKNOWN, f"处理异常: {e}")
+        return (RENEW_UNKNOWN, f"处理异常: {e}", None)
 
 #  脚本执行入口 (可选代理)
+
+
+def _alert_action(status, remaining_days):
+    """告警决策纯函数（可单测）。返回 (icon, text, should_alert)。
+    should_alert=True → 发 TG ❌ 且让 Actions 失败；False → 静默/低噪。
+    用户拍板：只有真问题才告警；能续但暂时续不上/健康冷却期不吵。
+      - PASS      : ✅ 通知（确认信息，非告警）
+      - SUSPENDED : ❌ 告警（真死/需人工处理）
+      - UNCONFIRMED 剩≤2天: ❌ 告警（临近到期没续上，需核对）
+      - UNKNOWN    : ❌ 告警（连流程都没跑通，无法排除已到期，需查看）
+      - COOLDOWN  / UNCONFIRMED 无天数或剩>2天: 静默（健康/用户处理不了）
+    """
+    if status == RENEW_PASS:
+        return "✅", "续期成功", False
+    if status == RENEW_SUSPENDED:
+        return "❌", "服务器已 suspend，需手动处理", True
+    if status == RENEW_UNKNOWN:
+        return "❌", "续期流程未跑通，需查看", True
+    if status == RENEW_UNCONFIRMED and remaining_days is not None and remaining_days <= MAX_CONFIRMED_ALERT_DAYS:
+        return "❌", "临近到期未确认续上", True
+    # COOLDOWN / UNCONFIRMED(无天数或剩>2)：静默
+    return "", "", False
+
+
 def main():
     print("#" * 25)
     print("   katabump 自动登录续期")
@@ -1194,6 +1355,21 @@ def main():
     cooldown = 0
     failed = 0
     max_attempts = int(os.environ.get("NODE_ATTEMPTS", "3"))
+
+    # ------------------------------------------------------------------
+    # 告警决策表（用户拍板：只有真问题才告警；能跑但暂时续不上/健康冷却期不吵）。
+    # ① RENEW_PASS        -> ✅ 发成功（低噪确认，非告警）。
+    # ② RENEW_SUSPENDED   -> 硬红告警 + Actions 失败；真死/需人工处理。
+    # ③ RENEW_COOLDOWN    -> 健康冷却，静默（不发 TG、不红 CI）。
+    # ④ RENEW_UNCONFIRMED:
+    #    - 剩 ≤2 天（临近到期没续上） -> 红告警 + 失败（真问题，需核对）。
+    #    - 其余（无天数信息/冷却期）   -> 静默（服务器未必死，用户眼下处理不了，别吵；
+    #                                  真死会被 ② suspended 兜住）。
+    # ⑤ RENEW_UNKNOWN（登录/流程失败）-> 红告警 + 失败（非静默！）：
+    #    这是「连流程都没跑通、看不到页面」，无法排除已到期/被 suspend 的可能，
+    #    静默会在真到期窗口掩盖问题（重演 09-03 静默掩盖到期）；且健康日不会出现，
+    #    出现即真信号（代理池挂/Turnstile 回归/脚本 bug），用户可处理 → 必须告警。
+    #------------------------------------------------------------------
     for idx, acc in enumerate(ACCOUNTS, 1):
         email = acc["email"]
         pwd   = acc["password"]
@@ -1203,37 +1379,62 @@ def main():
 
         acc_res = RENEW_UNKNOWN
         acc_detail = ""
-        for attempt in range(1, max_attempts + 1):
-            print(f"  ── 节点尝试 {attempt}/{max_attempts} ──")
-            if attempt > 1:
-                _restart_proxy()
-            st, detail = _run_account(sb_kwargs, email, pwd)
-            acc_res = st
-            acc_detail = detail or acc_detail
-            if st == RENEW_PASS:
-                break
-            if st == RENEW_COOLDOWN:
-                # 冷却期是终结态：重试也不会变成可续，直接结束，避免 3 次重复尝试与重复通知
-                break
-            # 未确认/失败：可再换节点试（后续详尽看）。
+        acc_rdays = None
+
+        # [根因] 状态提前跳过：状态文件里记载上次成功续期后的 expiry，若距到期还有充足余量
+        #        （剩余天数 > MAX_CONFIRMED_ALERT_DAYS），说明处于健康冷却期，根本不启动浏览器、
+        #        不点 Renew，直接按冷却期静默结束——从根源消除“冷却期无谓点 Renew→拿 unconfirmed”。
+        #        fail-open：状态缺失/损坏/已到期 → 返回 None，照常走完整流程，绝不因跳过漏报真死。
+        skipdays = _days_until_next_renewable(email)
+        if skipdays is not None and skipdays > MAX_CONFIRMED_ALERT_DAYS:
+            acc_res = RENEW_COOLDOWN
+            acc_rdays = skipdays
+            acc_detail = f"冷却期跳过（上次 expiry 距今约 {skipdays} 天，未到续期窗口）"
+            print(f"⏳ [根因] 账号 {email} 冷却期跳过：距上次 expiry 约 {skipdays} 天 > {MAX_CONFIRMED_ALERT_DAYS}，不点 Renew。")
+        else:
+            for attempt in range(1, max_attempts + 1):
+                print(f"  ── 节点尝试 {attempt}/{max_attempts} ──")
+                if attempt > 1:
+                    _restart_proxy()
+                st, detail, rdays = _run_account(sb_kwargs, email, pwd)
+                if rdays is not None:
+                    acc_rdays = rdays
+                acc_res = st
+                acc_detail = detail or acc_detail
+                if st == RENEW_PASS:
+                    # 续期成功：尝试记录新 expiry，供后续 run 冷却期跳过
+                    exp = _extract_expiry(detail)
+                    if exp:
+                        _save_state(email, exp.isoformat())
+                    break
+                if st == RENEW_COOLDOWN:
+                    # 冷却期是终结态：重试也不会变成可续，直接结束，避免 3 次重复尝试与重复通知
+                    break
+                # 未确认/失败：可再换节点试（后续详尽看）。
+
+        # ---------- 告警决策（见 _alert_action 注释表） ----------
+        icon, atext, should_alert = _alert_action(acc_res, acc_rdays)
         if acc_res == RENEW_PASS:
             renewed += 1
             print(f"✅ 账号 {email} 续期成功")
-            send_tg_message("✅", "续期成功", acc_detail or "续期成功")
-        elif acc_res == RENEW_COOLDOWN:
-            cooldown += 1
-            print(f"⏳ 账号 {email} 冷却中（未到续期）")
-            # 统一只发一条冷却通知（此前每个节点尝试都发，导致一天/一次 run 重复刷屏）
-            send_tg_message("⏳", "未到续期时间（冷却中）", (acc_detail or "未到续期") + f" | 账户 {email}")
-        else:
+            send_tg_message(icon, atext, acc_detail or "续期成功")
+        elif should_alert:
+            # 真·问题：suspended / 流程未跑通 / 临近到期未确认续上 → 红告警 + Actions 失败
             failed += 1
-            print(f"❌ 账号 {email} 未能确认续期（{acc_res}）")
-            send_tg_message("❌", "续期失败/未确认", f"{email} status={acc_res} | {acc_detail}")
+            extra = f"（剩 {acc_rdays} 天）" if acc_res == RENEW_UNCONFIRMED and acc_rdays is not None else ""
+            print(f"❌ 账号 {email} {atext}{extra}（{acc_res}）：{acc_detail or ''}")
+            send_tg_message(icon, atext, f"{email} {acc_res} | {acc_detail}")
+        else:
+            # 健康冷却期 / 无天数 unconfirmed：用户当下处理不了（到期日未知/未到），
+            # 且真死由 suspended 硬告警兜底 → 静默，仅记日志，不发 TG、不因 CI 失败。
+            cooldown += 1
+            extra = f"剩 {acc_rdays} 天" if acc_rdays is not None else "天数未知"
+            print(f"⏳ 账号 {email} 本次未触发告警（{acc_res}，{extra}）：{acc_detail or ''}")
 
     print("\n" + "#" * 25)
-    print(f"  处理完毕：续期成功 {renewed} / 冷却 {cooldown} / 失败 {failed} / 共 {len(ACCOUNTS)}")
+    print(f"  处理完毕：续期成功 {renewed} / 无告警(冷却/未确认) {cooldown} / 需处理失败 {failed} / 共 {len(ACCOUNTS)}")
     print("#" * 25)
-    # 只要存在「未确认/失败」（不是冷却），才让 Actions 失败报警
+    # 只有存在“真正需用户处理”的失败（需告警类型）才让 Actions 红灯
     if failed > 0:
         raise SystemExit(1)
 

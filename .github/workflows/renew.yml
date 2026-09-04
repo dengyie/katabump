@@ -13,6 +13,16 @@ jobs:
     steps:
     - uses: actions/checkout@v6
 
+    # [根因] 状态跨 run 持久化：当天 run 记录的 expiry，供后续冷却期 run 直接跳过 Renew。
+    # cache 键不可变 → restore 用前缀匹配最近一次，save 用 run_id 唯一键（旧条目自动 LRU 淘汰）。
+    - name: Restore renew-state cache
+      uses: actions/cache/restore@v4
+      with:
+        path: renew_state.json
+        key: renew-state-${{ github.run_id }}
+        restore-keys: |
+          renew-state-
+
     - name: Setup Python
       uses: actions/setup-python@v6
       with:
@@ -83,6 +93,15 @@ jobs:
         TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
         TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
       run: xvfb-run --auto-servernum --server-args="-screen 0 1920x1080x24" python3 app.py
+
+    # [根因] 把本次 run 更新后的 renew_state.json 存回（run_id 唯一键，供下次 restore）。
+    # always(): 即使续期失败也留续状态，避免重跑挖掉已续记记录。
+    - name: Save renew-state cache
+      if: always()
+      uses: actions/cache/save@v4
+      with:
+        path: renew_state.json
+        key: renew-state-${{ github.run_id }}
 
     - name: Upload Screenshots
       if: always()
